@@ -1,0 +1,34 @@
+```{r}
+library(data.table)
+library(ggplot2)
+```
+
+```{r,width=5}
+dat = fread("dec_2024_dauer_compound_stability.csv")
+dat$label = paste0(dat$Compound, " (",dat$Concentration,")",ifelse(dat$`Ageing Type`=="aged seeded","","(unseeded)"))
+dat$gr2 = paste0(dat$Compound, ifelse(dat$`Ageing Type`=="aged seeded","","(unseeded)"))
+dat_agg = aggregate(`% Dauer`~`Plate Age - since seeding`+Compound+Concentration+label+gr2,dat,FUN=mean)
+dat2 = dat[`Ageing Type` == "aged seeded",]
+dat_agg[dat_agg$`Plate Age - since seeding`==28,]
+
+gp1 = ggplot(dat2,aes(`Plate Age - since seeding`,`% Dauer`,group=label,fill=Compound,color=Compound)) + 
+  geom_line(data=dat_agg) + 
+  geom_point(data=dat2[Concentration!="0nM",],size=2,pch=21,color="black") +
+  scale_x_continuous(breaks=seq(0,32.5,by=2.5),labels=unlist(lapply(seq(0,30,by=5),function(x)c(x,""))))+
+  geom_point(data=dat2[Concentration=="0nM",],size=2,pch=22,color="black") + xlab("Age of plate (days since seeding)") + ylab("Fraction Dauer")
+  
+gp1
+
+dat2 = dat[`Plate Age - since seeding` == 28& Concentration!="0nM" & Compound=="K-NAA",]
+dat2$at = substring(dat2[,`Ageing Type` ],6)
+gp2 = ggplot(dat2,aes(at,`% Dauer`,group=label)) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  geom_point(data=dat2[Concentration!="0nM",],size=2,pch=21,color="black",fill="#3377FF") +
+  geom_point(data=dat2[Concentration=="0nM",],size=2,pch=22,color="black",fill="#3377FF") + xlab("") + ylab("Fraction Dauer")
+gp2
+
+ggpubr::ggarrange(gp1,gp2,nrow=1,widths=c(4,1))
+ggsave("dauer_plate_aging_assay.pdf",width=10,height=5)
+
+```
+

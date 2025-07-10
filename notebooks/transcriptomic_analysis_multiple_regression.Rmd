@@ -1,0 +1,3593 @@
+---
+title: "global_assessment"
+author: "MEder"
+date: "06/11/2023"
+output: html_document
+---
+
+```{r, setup, include=FALSE}
+library(data.table)
+library(ggplot2)
+library(ggplotify)
+library(gplots)
+library(car)
+library(stringr)
+library(matrixStats)
+library(corrplot)
+library(scran)
+#library(HelpingHand)
+library(DESeq2)
+library(Rtsne)
+library(cowplot)
+library(plotly)
+library(ggrepel)
+library(scales)
+library(ggpubr)
+library(dplyr)
+library(tidyr)
+library(matrixStats)
+library(edgeR)
+
+normalizeUsingSpikeins <- function(counts, conditions, tech, input, mincount = 100) {
+  
+  counts <- as.matrix(counts)
+  bio <- ! tech
+  
+  uniq_cond <- unique(conditions)
+  
+  # normalize without offset
+  results <- lapply(uniq_cond, function(cond) {
+    
+    # subset of counts
+    x <- counts[, conditions == cond, drop = FALSE]
+    
+    # technical factor - nu
+    counts_tech <- as.data.table(cbind(input = input, x[tech, ]))
+    counts_tech <- melt(counts_tech, id.vars = "input", variable.name = "sample", value.name = "count")
+    nu <- counts_tech[count > mincount, exp(median(log(count) - log(input))), by = sample]$V1
+    names(nu) <- colnames(x)
+    
+    # size factor - phi
+    logprenorm <- log(sapply(1:ncol(x), function(i) x[bio, i] / nu[i]) + 0.5)
+    ref <- rowMedians(logprenorm)
+    phi <- apply(logprenorm, 2, function(x) exp(median(x - ref)))
+    names(phi) <- colnames(x)
+    
+    # median mean gene expression
+    medexp <- median(rowMedians(sapply(1:ncol(x), function(i) x[bio, i] / (phi[i] * nu[i]))))
+    
+    list(nu = nu, phi = phi, medexp = medexp)
+  })
+  
+  # compute offset
+  refmedexp <- results[[1]]$medexp
+  offset <- sapply(results, function(x) x$medexp) / refmedexp
+  
+  # normalize with offset
+  results <- lapply(1:length(uniq_cond), function(i) {
+    
+    cond <- uniq_cond[i]
+    x <- counts[, conditions == cond, drop = FALSE]
+    o <- offset[i]
+    phi <- results[[i]]$phi * o
+    nu <- results[[i]]$nu
+    
+    # normalized counts with offset
+    y <- sapply(1:ncol(x), function(i) {
+      c(x[bio, i] / (phi[i] * nu[i]), x[tech, i] / nu[i])
+    })
+    y <- y[match(rownames(x), rownames(y)), ]
+    rownames(y) <- rownames(x)
+    colnames(y) <- colnames(x)
+    y
+    list(y = y, nu = nu, phi = phi, offset = o)
+  })
+  
+  # format
+  y <- Reduce(cbind, lapply(results, `[[`, "y"))
+  nu <- Reduce(c, lapply(results, `[[`, "nu"))
+  phi <- Reduce(c, lapply(results, `[[`, "phi"))
+  o <- Reduce(c, lapply(results, `[[`, "offset"))
+  
+  list(y = y, nu = nu, phi = phi, offset = o)
+  
+}
+
+smoothTowardIndependance <- function(x) {
+  n <- nrow(x)
+  p <- ncol(x)
+  rs <- matrix(matrixStats::rowSums2(x), nrow = n, ncol = 1L)
+  cs <- matrix(matrixStats::colSums2(x), nrow = 1L, ncol = p)
+  ts <- sum(cs)
+  pc <- 0.5 * n * p * (rs %*% cs) / ts**2
+  x + pc
+}
+
+plotTissue <- function(tissue) {
+  
+  tissue[, Score := Prediction_Score]
+  tissue[, Heatmap_Score := NULL]
+  tissue[, Prediction_Score := NULL]
+  tissue[, Tissue := gsub("_", " ", Tissue)]
+  tissue[, Tissue := gsub(" $", "", Tissue)]
+  
+  tm <- castToMatrix(tissue, Tissue ~ Gene, "Score")
+  genes <- sort(unique(tissue$Gene), decreasing = TRUE)
+  tissue <- rbind(tissue, 
+                  tissue[, .(Gene = "", Score = 0), by = Tissue ],
+                  tissue[, .(Gene = "Mean", Score = median(Score)), by = Tissue ])
+  tissue[, Gene := factor(Gene, levels = c(genes, "", "Mean"))]
+  tissue[, Tissue := factor(Tissue, levels = c(rownames(tm)[order(rowMeans(tm), decreasing = TRUE)]))]
+  
+  ggplot(tissue, aes(Tissue, Gene, fill = Score)) +
+    geom_tile() +
+    scale_fill_gradient2(low = "red", high = "blue", limits = c(-5, 5)) + 
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), 
+          legend.text = element_text(size = 20),
+          text = element_text(size = 30),
+          axis.text = element_text(size = 24))
+}
+
+"%!in%" <- function(x,y)!("%in%"(x,y))
+
+memory.limit(size=56000)
+
+theme_set(theme_cowplot())
+
+knitr::opts_chunk$set(echo = TRUE)
+
+castToMatrix = function(data,formula,value.var){
+  counts = dcast(data,formula,value.var=value.var)
+  cnames = counts$GeneName;
+  counts = as.matrix(counts[,2:ncol(counts)])
+  rownames(counts) = cnames;
+  counts
+}
+
+
+```
+
+## load data
+```{r echo=FALSE}
+df <- fread("../data/annotated_counts/counts.csv.gz")
+df <- df[-which(df$GeneName == "WBGene00004622"),]
+
+annotations_aie <- fread("../data/annotations/sample_annotations_corrected.csv")
+annotations_aie[, Technical_replicate := factor(Technical_replicate)]
+annotations_aie[, Biological_replicate := factor(Biological_replicate)]
+annotations_aie[, Genotype := gsub("-", "", Genotype)]
+annotations_aie[, Condition := as.factor(Condition)]
+#levels(annotations_aie$Condition) <- gsub("_[0-9]$", "", levels(annotations_aie$Condition))
+annotations_aie[, Condition := relevel(factor(Condition), ref = "A216_noAux_d1")]
+
+
+df <- merge(df, annotations_aie, by = "Basename")
+df <- df[,c(1:6, 10,11,14:18)]
+#levels(df$Condition) <- gsub("_[0-9]$", "", levels(df$Condition))
+
+geneid <- fread("../../reference/annotations/c_elegans.PRJNA13758.WS265.geneIDs.txt.gz")
+geneid[V3 == "", V3 := V4]
+geneid <- geneid[, .(GeneName = V2, GeneSymbol = V3, GeneType  = V6)]
+geneid <- geneid[! duplicated(GeneName)]
+```
+
+## subset
+```{r echo=FALSE}
+#choose experiment that included all strains without any compounds
+#df <- df[which(df$Sample %in% annotations_aie[Biological_replicate==2,Sample])]
+
+```
+
+## normalization
+### convert to matrix and filter low counts
+```{r echo=FALSE}
+counts <- castToMatrix(data = df[! grepl("^ERCC", GeneName)],
+                       GeneName ~ Sample, value.var = "Count")
+```
+
+### check readcount
+We check which samples have a sequencing depth lower than count_thresh. Usually, we aim for a threshold of ~ 200000.
+```{r}
+count_thresh = median(colSums(counts))/10
+hist(log10(colSums(counts)))
+abline(v = log10(count_thresh))
+```
+ 
+```{r echo=FALSE}
+cat("Samples with readcounts < ", count_thresh)
+print(colnames(counts)[colSums(counts) < count_thresh])
+```
+### check mRNA/spike-in ratio
+We check which samples have a low content of mRNA.
+```{r}
+mRNA_content <- colSums(castToMatrix(data = df[! grepl("^ERCC", GeneName)],
+                        GeneName ~ Sample, value.var = "Count"))/
+                        (colSums(castToMatrix(data = df[grepl("^ERCC", GeneName)],
+                        GeneName ~ Sample, value.var = "Count")) +
+                        colSums(castToMatrix(data = df[! grepl("^ERCC", GeneName)],
+                        GeneName ~ Sample, value.var = "Count")))
+
+hist(mRNA_content)
+```
+
+```{r echo=FALSE}
+cat("Samples with < 75% mRNA:")
+print(colnames(counts)[mRNA_content < 0.75])
+```
+
+### delete low count samples, delete low mRNA samples and filter low counts transcripts
+We only consider transcripts that have at least 5 counts in more than 50% of the samples. We end up with:
+```{r echo=FALSE}
+counts <- counts[,which(colSums(counts) > count_thresh & mRNA_content > 0.75)]
+filter <- rowMeans(counts)>10 & apply(counts,1,function(x)(length(which(x>0))/length(x))>.75)
+counts <- counts[filter, ]
+annotations_aie <- annotations_aie[match(colnames(counts), annotations_aie$Sample)]
+#annots_full <- annotations_aie
+```
+`r length(which(filter == TRUE))` transcripts.
+
+
+
+```{r}
+#look at effect of TIR1 variant using the wrong type of cross-term model
+if (0){
+annots_aux_ind_x_double1 = annots_aux_ind[Genotype=="N2",]
+counts_aux_ind_x_double1 = counts_aux_ind[,annots_aux_ind_x_double1$Sample]
+annots_aux_ind_x_double2 = annots_aux_ind[Genotype=="N2",]
+counts_aux_ind_x_double2 = counts_aux_ind[,annots_aux_ind_x_double2$Sample]
+annots_aux_ind_x_double3 = annots_aux_ind[Genotype=="N2",]
+counts_aux_ind_x_double3 = counts_aux_ind[,annots_aux_ind_x_double3$Sample]
+colnames(counts_aux_ind_x_double1)=paste0(colnames(counts_aux_ind_x_double1),"x1")
+colnames(counts_aux_ind_x_double2)=paste0(colnames(counts_aux_ind_x_double2),"x2")
+colnames(counts_aux_ind_x_double3)=paste0(colnames(counts_aux_ind_x_double2),"x3")
+
+annots_aux_ind_x_double1$Genotype="N2_1";
+annots_aux_ind_x_double2$Genotype="N2_2";
+annots_aux_ind_x_double3$Genotype="N2_3";
+annots_aux_ind_x_double1$Sample = colnames(counts_aux_ind_x_double1)
+annots_aux_ind_x_double2$Sample = colnames(counts_aux_ind_x_double2)
+annots_aux_ind_x_double3$Sample = colnames(counts_aux_ind_x_double3)
+
+ind_Genotype_mapping_x = data.table(Genotype=c("eft3p::TIR1[F79G]",
+                                    "eft3p::TIR1[F79A]",
+                                    "eft3p::TIR1",
+                                    "eif3p::TIR1",
+                                    "N2",
+                                    "N2_1",
+                                    "N2_2",
+                                    "N2_3"),
+                                  label=c("eft3p_F79G_0xAID",
+                                          "eft3p_F79A_0xAID",
+                                          "eif3p_F79F_0XAID",
+                                          "eft3p_F79F_0XAID",
+                                          "N_N_0xAID",
+                                          "N_N_0xAID_1",
+                                          "N_N_0xAID_2",
+                                          "N_N_0xAID_3"),
+                                  TIR1 = c(T,T,T,T,F,F,F,F),
+                                  Variant= c("G","A","E","F","G","A","E","F"))
+
+
+annots_aux_ind_x = rbind(annots_aux_ind,
+                         annots_aux_ind_x_double1,
+                         annots_aux_ind_x_double2,
+                         annots_aux_ind_x_double3)[Biological_replicate==2 & Genotype %in% ind_Genotype_mapping_x$Genotype,]
+
+genes_to_exclude = c("TIR1-DERNBERG")
+counts_aux_ind_x = cbind(counts_aux_ind,
+                         counts_aux_ind_x_double1,
+                         counts_aux_ind_x_double2,
+                         counts_aux_ind_x_double3)[ rownames(counts_aux_ind)%!in%genes_to_exclude,annots_aux_ind_x$Sample]
+nf_aux_ind_x <- calculateSumFactors(counts_aux_ind_x)
+
+
+setkey(ind_Genotype_mapping_x,Genotype)
+annots_aux_ind_x$label = factor(ind_Genotype_mapping_x[annots_aux_ind_x$Genotype,label])
+annots_aux_ind_x$label = relevel(annots_aux_ind_x$label,"N_N_0xAID")
+annots_aux_ind_x$TIR1 = factor(ind_Genotype_mapping_x[annots_aux_ind_x$Genotype,TIR1])
+annots_aux_ind_x$TIR1 = relevel(annots_aux_ind_x$TIR1,"FALSE")
+annots_aux_ind_x$Variant = factor(ind_Genotype_mapping_x[annots_aux_ind_x$Genotype,Variant])
+annots_aux_ind_x$Variant = relevel(annots_aux_ind_x$Variant,"F")
+
+dds_aux_ind_x<- DESeqDataSetFromMatrix(countData = counts_aux_ind_x,
+                                     colData = annots_aux_ind_x,
+                                     design = ~ TIR1*Variant)
+sizeFactors(dds_aux_ind_x) <- nf_aux_ind_x # use scran normalization
+dds_aux_ind_x <- estimateDispersions(dds_aux_ind_x) # estimate overdispersion parameter
+dds_aux_ind_x <- nbinomWaldTest(dds_aux_ind_x) # run NB GLM and do Wald Test on coefficients
+
+results_aux_ind_x <- lapply(resultsNames(dds_aux_ind_x), function(i) {
+  r <- results(dds_aux_ind_x, name = i)
+  r <- as.data.table(r)
+  colnames(r) <- paste0(i, "_", colnames(r))
+  r
+})
+results_aux_ind2_x = cbind(results_aux_ind_x[[1]],results_aux_ind_x[[2]],results_aux_ind_x[[3]],results_aux_ind_x[[4]],results_aux_ind_x[[5]],results_aux_ind_x[[6]])
+results_aux_ind2_x[, GeneName := rownames(counts_aux_ind_x)]
+
+results_aux_ind_x_long <- rbindlist(lapply(resultsNames(dds_aux_ind_x), function(i) {
+  r <- results(dds_aux_ind_x, name = i)
+  r <- as.data.table(r)
+  r[, GeneName := rownames(counts_aux_ind_x)]
+  r$covariate = i
+  r
+}))
+}
+```
+
+
+```{r}
+#recalc the effects of TIr1;daf-2::AID relative to N2, eg the "basal" effect of the AID system
+ref_group = "N2"
+r2 = "eft3p::TIR1::mRuby; daf2::AID::3xFLAG(codon optimized)" 
+annots_aux_ind_double = annotations_aie[Biological_replicate==1 & Genotype %in% c(ref_group,r2) & Auxin==F & Day==1,]
+genes_to_exclude = c("TIR1-DERNBERG")
+counts_aux_ind_double = counts[ rownames(counts)%!in%genes_to_exclude,annots_aux_ind_double$Sample]
+nf_aux_ind_double <- calculateSumFactors(counts_aux_ind_double)
+
+ind_double_Genotype_mapping = data.table(Genotype=c(r2,
+                                    "N2"),
+                                  label=c("eft3p_F79F_1XAID",
+                                          "N_N_0xAID"))
+setkey(ind_double_Genotype_mapping,Genotype)
+annots_aux_ind_double$label = factor(ind_double_Genotype_mapping[annots_aux_ind_double$Genotype,label])
+annots_aux_ind_double$label = relevel(annots_aux_ind_double$label,"N_N_0xAID")
+dds_aux_ind_double<- DESeqDataSetFromMatrix(countData = counts_aux_ind_double,
+                                     colData = annots_aux_ind_double,
+                                     design = ~ label)
+sizeFactors(dds_aux_ind_double) <- nf_aux_ind_double # use scran normalization
+dds_aux_ind_double <- estimateDispersions(dds_aux_ind_double) # estimate overdispersion parameter
+dds_aux_ind_double <- nbinomWaldTest(dds_aux_ind_double) # run NB GLM and do Wald Test on coefficients
+
+results_aux_ind_double <- lapply(resultsNames(dds_aux_ind_double), function(i) {
+  r <- results(dds_aux_ind_double, name = i)
+  r <- as.data.table(r)
+  colnames(r) <- paste0(i, "_", colnames(r))
+  r
+})
+
+results_aux_ind_long_double <- rbindlist(lapply(resultsNames(dds_aux_ind_double), function(i) {
+  r <- results(dds_aux_ind_double, name = i)
+  r <- as.data.table(r)
+  r[, GeneName := rownames(counts_aux_ind_double)]
+  r$covariate = i
+  r
+}))
+results_aux_ind_long_double = results_aux_ind_long_double[covariate != "Intercept",]
+results_aux_ind_long_double[,group:=substring(covariate,7,nchar(covariate)-13)]
+setkey(ind_double_Genotype_mapping,Genotype)
+results_aux_ind_long_double[,label:=group]
+
+```
+
+
+```{r}
+#recalc the effects auxin in the presence of the double (e.g the "on target" effects) *only for wildtype
+#NOTE: THiS APPROACH ASSUMES THE effects of auxin are *additive* to the effects of TIR1, which they are *not* because adding TIR1 appears to 
+#protect the animals against some effects of Auxin.  
+#The result is that these "on-target" effects have baked into them the effects of auxin that are removed by adding TIR1
+#these effects are *different* between the different TIR1 variants and so they artifically inflate the differences between variants.
+if (0){
+annots_ontarget = annotations_aie[Promoter=="eft3p" & Tir1=="WT"&Day==1&daf2AID==1,]
+genes_to_exclude = c("TIR1-DERNBERG")
+counts_ontarget= counts[ rownames(counts)%!in%genes_to_exclude,annots_ontarget$Sample]
+nf_ontarget <- calculateSumFactors(counts_ontarget)
+
+
+annots_ontarget$label = factor(ifelse(annots_ontarget$Auxin,"auxin","none"))
+annots_ontarget$label = relevel(annots_ontarget$label,"none")
+dds_aux_ontarget<- DESeqDataSetFromMatrix(countData = counts_ontarget,
+                                     colData = annots_ontarget,
+                                     design = ~ label)
+sizeFactors(dds_aux_ontarget) <- nf_ontarget # use scran normalization
+dds_aux_ontarget <- estimateDispersions(dds_aux_ontarget) # estimate overdispersion parameter
+dds_aux_ontarget <- nbinomWaldTest(dds_aux_ontarget) # run NB GLM and do Wald Test on coefficients
+
+results_aux_ontarget <- lapply(resultsNames(dds_aux_ontarget), function(i) {
+  r <- results(dds_aux_ontarget, name = i)
+  r <- as.data.table(r)
+  colnames(r) <- paste0(i, "_", colnames(r))
+  r
+})
+
+results_aux_ontarget_long <- rbindlist(lapply(resultsNames(dds_aux_ontarget), function(i) {
+  r <- results(dds_aux_ontarget, name = i)
+  r <- as.data.table(r)
+  r[, GeneName := rownames(counts_ontarget)]
+  r$covariate = i
+  r
+}))
+results_aux_ontarget_long = results_aux_ontarget_long[covariate != "Intercept",]
+results_aux_ontarget_long[,group:=substring(covariate,7,nchar(covariate)-8)]
+results_aux_ontarget_long[,label:=group]
+}
+
+```
+
+```{r}
+#recalc the effects auxin in the presence of the double (e.g the "on target" effects) *across all three
+#NOTE: THiS APPROACH ASSUMES THE effects of auxin are *additive* to the effects of TIR1, which they are *not* because adding TIR1 appears to 
+#protect the animals against some effects of Auxin.  
+#The result is that these "on-target" effects have baked into them the effects of auxin that are removed by adding TIR1
+#these effects are *different* between the different TIR1 variants and so they artifically inflate the differences between variants.
+if (0){
+annots_ontarget = annotations_aie[Promoter=="eft3p" &Day==1&daf2AID==1,]
+genes_to_exclude = c("TIR1-DERNBERG")
+counts_ontarget= counts[ rownames(counts)%!in%genes_to_exclude,annots_ontarget$Sample]
+nf_ontarget <- calculateSumFactors(counts_ontarget)
+
+
+annots_ontarget$label = factor(ifelse(annots_ontarget$Auxin,"auxin","none"))
+annots_ontarget$label = relevel(annots_ontarget$label,"none")
+dds_aux_ontarget_all3<- DESeqDataSetFromMatrix(countData = counts_ontarget,
+                                     colData = annots_ontarget,
+                                     design = ~ label)
+sizeFactors(dds_aux_ontarget_all3) <- nf_ontarget # use scran normalization
+dds_aux_ontarget_all3 <- estimateDispersions(dds_aux_ontarget_all3) # estimate overdispersion parameter
+dds_aux_ontarget_all3 <- nbinomWaldTest(dds_aux_ontarget_all3) # run NB GLM and do Wald Test on coefficients
+
+results_aux_ontarget_all3 <- lapply(resultsNames(dds_aux_ontarget_all3), function(i) {
+  r <- results(dds_aux_ontarget_all3, name = i)
+  r <- as.data.table(r)
+  colnames(r) <- paste0(i, "_", colnames(r))
+  r
+})
+
+results_aux_ontarget_long_all3 <- rbindlist(lapply(resultsNames(dds_aux_ontarget_all3), function(i) {
+  r <- results(dds_aux_ontarget_all3, name = i)
+  r <- as.data.table(r)
+  r[, GeneName := rownames(counts_ontarget)]
+  r$covariate = i
+  r
+}))
+results_aux_ontarget_long_all3 = results_aux_ontarget_long_all3[covariate != "Intercept",]
+results_aux_ontarget_long_all3[,group:=substring(covariate,7,nchar(covariate)-8)]
+}
+
+```
+
+```{r}
+if (0){
+#recalc the effects auxin in the presence of the double (e.g the "on target" effects) *Differences between variants
+annots_ontarget = annotations_aie[Promoter=="eft3p" & Auxin==T & Day==1& daf2AID==1,]
+genes_to_exclude = c("TIR1-DERNBERG")
+counts_ontarget= counts[ rownames(counts)%!in%genes_to_exclude,annots_ontarget$Sample]
+nf_ontarget <- calculateSumFactors(counts_ontarget)
+
+
+annots_ontarget$Tir1 = relevel(factor(annots_ontarget$Tir1),"WT")
+dds_aux_ontarget_variant_effects<- DESeqDataSetFromMatrix(countData = counts_ontarget,
+                                     colData = annots_ontarget,
+                                     design = ~ Tir1)
+sizeFactors(dds_aux_ontarget_variant_effects) <- nf_ontarget # use scran normalization
+dds_aux_ontarget_variant_effects <- estimateDispersions(dds_aux_ontarget_variant_effects) # estimate overdispersion parameter
+dds_aux_ontarget_variant_effects <- nbinomWaldTest(dds_aux_ontarget_variant_effects) # run NB GLM and do Wald Test on coefficients
+
+results_aux_ontarget_variant_effects <- lapply(resultsNames(dds_aux_ontarget_variant_effects), function(i) {
+  r <- results(dds_aux_ontarget_variant_effects, name = i)
+  r <- as.data.table(r)
+  colnames(r) <- paste0(i, "_", colnames(r))
+  r
+})
+
+results_aux_ontarget_long_variant_effects <- rbindlist(lapply(resultsNames(dds_aux_ontarget_variant_effects), function(i) {
+  r <- results(dds_aux_ontarget_variant_effects, name = i)
+  r <- as.data.table(r)
+  r[, GeneName := rownames(counts_ontarget)]
+  r$covariate = i
+  r
+}))
+results_aux_ontarget_long_variant_effects = results_aux_ontarget_long_variant_effects[covariate != "Intercept",]
+results_aux_ontarget_long_variant_effects[,group:=substring(covariate,7,nchar(covariate)-8)]
+}
+```
+```{r}
+if (0){
+#recalc the effects auxin in the presence of the double (e.g the "on target" effects) *Differences between variants
+annots_ontarget = annotations_aie[Promoter=="eft3p" & Auxin==T & Day==1& daf2AID==1,]
+genes_to_exclude = c("TIR1-DERNBERG")
+counts_ontarget= counts[ rownames(counts)%!in%genes_to_exclude,annots_ontarget$Sample]
+nf_ontarget <- calculateSumFactors(counts_ontarget)
+
+
+annots_ontarget$Tir1 = relevel(factor(annots_ontarget$Tir1),"WT")
+dds_aux_ontarget_variant_effects<- DESeqDataSetFromMatrix(countData = counts_ontarget,
+                                     colData = annots_ontarget,
+                                     design = ~ Tir1)
+sizeFactors(dds_aux_ontarget_variant_effects) <- nf_ontarget # use scran normalization
+dds_aux_ontarget_variant_effects <- estimateDispersions(dds_aux_ontarget_variant_effects) # estimate overdispersion parameter
+dds_aux_ontarget_variant_effects <- nbinomWaldTest(dds_aux_ontarget_variant_effects) # run NB GLM and do Wald Test on coefficients
+
+results_aux_ontarget_variant_effects <- lapply(resultsNames(dds_aux_ontarget_variant_effects), function(i) {
+  r <- results(dds_aux_ontarget_variant_effects, name = i)
+  r <- as.data.table(r)
+  colnames(r) <- paste0(i, "_", colnames(r))
+  r
+})
+
+results_aux_ontarget_long_variant_effects <- rbindlist(lapply(resultsNames(dds_aux_ontarget_variant_effects), function(i) {
+  r <- results(dds_aux_ontarget_variant_effects, name = i)
+  r <- as.data.table(r)
+  r[, GeneName := rownames(counts_ontarget)]
+  r$covariate = i
+  r
+}))
+results_aux_ontarget_long_variant_effects = results_aux_ontarget_long_variant_effects[covariate != "Intercept",]
+results_aux_ontarget_long_variant_effects[,group:=substring(covariate,7,nchar(covariate)-8)]
+}
+```
+
+
+```{r,fig.width=15,fig.height=4}
+if (0){
+library(ggrastr)
+#compare TIR1 effects to variant_specific effects
+
+res = rbind(results_aux_ontarget_long_all3,results_aux_ontarget_long_variant_effects)
+
+axis_lims = c(-2.5,4)
+res[log2FoldChange<axis_lims[1],log2FoldChange:=axis_lims[1]]
+res[log2FoldChange>axis_lims[2],log2FoldChange:=axis_lims[2]]
+
+
+res_l_FC = dcast(res,GeneName~covariate,value.var="log2FoldChange")
+names(res_l_FC)[2:4] = paste0(names(res_l_FC)[2:4],".log2FC")
+
+res_l_padj = dcast(res,GeneName~covariate,value.var="padj")
+names(res_l_padj)[2:4] = paste0(names(res_l_padj)[2:4],".padj")
+
+res_l_a = merge(res_l_FC,res_l_padj,by="GeneName")
+res_l_a[,significance:=ifelse(label_auxin_vs_none.padj<.001 & Tir1_F79A_vs_WT.padj < .001,"Both",
+                      ifelse(label_auxin_vs_none.padj<.001,"All three variants",
+                             ifelse(Tir1_F79A_vs_WT.padj<.001,"TIR1[79A]-specific","Neither")))]
+res_l_a = res_l_a[!is.na(significance)&(significance!="Neither" | Tir1_F79G_vs_WT.padj < .001),]
+
+colors = c("black","#88EEFF","red")
+sizes = c(2,2,2)
+names(colors) = c("All three variants","TIR1[79A]-specific","Both")
+names(sizes) = c("All three variants","TIR1[79A]-specific","Both")
+  
+cr =cor(res_l_a$label_auxin_vs_none.log2FC,res_l_a$Tir1_F79A_vs_WT.log2FC)
+g1=ggplot(res_l_a,aes(label_auxin_vs_none.log2FC,Tir1_F79A_vs_WT.log2FC,color=significance)) + 
+  geom_smooth(method="lm",lwd=1,color="dark grey",se=F)+
+  geom_hline(yintercept=0,wd=1,color="grey",lty=2)+
+  geom_vline(xintercept=0,wd=1,color="grey",lty=2)+
+  geom_point_rast(aes(fill=significance,size=significance),pch=21,color="black",alpha=.5,raster.dpi=600) +  geom_abline(intercept=0,slope=1,lty=2,col="dark gray")+xlab("Common effect across all variants\n(log2 fold-change)")+ylab("TIR1[79A]-specific")+ scale_fill_manual(values=colors)+scale_size_manual(values=sizes)+theme(legend.position="none")+xlim(axis_lims[1],axis_lims[2])+ylim(axis_lims[1],axis_lims[2])+
+  annotate("text",label=paste0("rho=",round(cr,2)),x=axis_lims[1]*3/4,y=axis_lims[2]*3/4)
+  
+
+res_l_a = merge(res_l_FC,res_l_padj,by="GeneName")
+res_l_a[,significance:=ifelse(label_auxin_vs_none.padj<.001 & Tir1_F79G_vs_WT.padj < .001,"Both",
+                      ifelse(label_auxin_vs_none.padj<.001,"All three variants",
+                             ifelse(Tir1_F79G_vs_WT.padj<.001,"TIR1[79G]-specific","Neither")))]
+res_l_a = res_l_a[!is.na(significance)&(significance!="Neither" | Tir1_F79A_vs_WT.padj < .001),]
+
+names(colors) = c("All three variants","TIR1[79G]-specific","Both")
+names(sizes) = c("All three variants","TIR1[79G]-specific","Both")
+  
+
+cr =cor(res_l_a$label_auxin_vs_none.log2FC,res_l_a$Tir1_F79G_vs_WT.log2FC)
+g2=ggplot(res_l_a,aes(label_auxin_vs_none.log2FC,Tir1_F79G_vs_WT.log2FC,color=significance)) + 
+  geom_smooth(method="lm",lwd=1,color="dark grey",se=F)+
+  geom_hline(yintercept=0,wd=1,color="grey",lty=2)+
+  geom_vline(xintercept=0,wd=1,color="grey",lty=2)+
+  geom_point_rast(aes(fill=significance,size=significance),pch=21,color="black",alpha=.5,raster.dpi=600) +  geom_abline(intercept=0,slope=1,lty=2,col="dark gray")+xlab("Common effect across all variants\n(log2 fold-change)")+ylab("TIR1[79G]-specific")+ scale_fill_manual(values=colors)+scale_size_manual(values=sizes)+theme(legend.position="none")+xlim(axis_lims[1],axis_lims[2])+ylim(axis_lims[1],axis_lims[2])+
+  annotate("text",label=paste0("rho=",round(cr,2)),x=axis_lims[1]*3/4,y=axis_lims[2]*3/4)
+
+
+res_l_a = merge(res_l_FC,res_l_padj,by="GeneName")
+res_l_a[,significance:=paste0(ifelse(label_auxin_vs_none.padj<.001,"All three variants ",
+                      paste0(ifelse(Tir1_F79G_vs_WT.padj<.001,"TIR1[79G]-specific ",""),
+                       ifelse((label_auxin_vs_none.padj<.001 | Tir1_F79G_vs_WT.padj<.001) & Tir1_F79A_vs_WT.padj < .001 , " & ",""),
+                         ifelse(Tir1_F79A_vs_WT.padj<.001,"TIR1[79A]-specific",""))))]
+res_l_a = res_l_a[!grepl("NA",significance)&significance!="",]
+
+res_l_a[,variant_specific.log2FC :=ifelse(significance=="TIR1[79A]-specific",Tir1_F79A_vs_WT.log2FC,
+                                   ifelse(significance=="TIR1[79G]-specific",Tir1_F79G_vs_WT.log2FC,
+                                          (Tir1_F79G_vs_WT.log2FC+Tir1_F79A_vs_WT.log2FC)/2))]
+
+colors = c("black","#64C5EB","#E84D8A","#FEB326")
+names(colors) = c("All three variants ","TIR1[79A]-specific","TIR1[79G]-specific ","TIR1[79G]-specific  & TIR1[79A]-specific")
+sizes = c(2,2,2,2)
+names(colors) = c("All three variants ","TIR1[79A]-specific","TIR1[79G]-specific ","TIR1[79G]-specific  & TIR1[79A]-specific")
+  
+unique(res_l_a[,.(significance,colors[significance])])
+cr =cor(res_l_a$label_auxin_vs_none.log2FC,res_l_a$variant_specific.log2FC)
+g3=ggplot(res_l_a,aes(label_auxin_vs_none.log2FC,variant_specific.log2FC,color=significance)) + 
+  geom_smooth(method="lm",lwd=1,color="dark grey",se=F)+
+  geom_hline(yintercept=0,wd=1,color="grey",lty=2)+
+  geom_vline(xintercept=0,wd=1,color="grey",lty=2)+
+  geom_point_rast(aes(fill=significance,size=significance),pch=21,color="black",alpha=.7,raster.dpi=600) +  
+  geom_abline(intercept=0,slope=1,lty=2,col="dark gray")+xlab("Common effect across all variants\n(log2 fold-change)")+
+  ylab("TIR1[79G] or TIR1[79A]\n specific effect\n(log2 fold-change)")+ 
+  scale_fill_manual(values=colors)+
+  scale_size_manual(values=sizes)+xlim(axis_lims[1],axis_lims[2])+ylim(axis_lims[1],axis_lims[2])+
+  annotate("text",label=paste0("rho=",round(cr,2)),x=axis_lims[1]*3/4,y=axis_lims[2]*3/4)
+  
+ggarrange(plotlist=list(g1,g2,g3),widths=c(1,1,2.2),nrow=1)
+ggsave("general_vs_specific_TIR1_ontarget_effects.pdf",width=15,height=4)
+}
+
+```
+
+
+```{r}
+#compare the effects of different variants to each other, accounting for the "off-target" effects of compounds
+#y = B_compound * B_TIR1 + e
+#for 1x degrons
+
+#this is good and important because there are effects of the compounds that are removed by adding TIR1, and modelling B_compound
+#as consistent across all conditions excludes these.
+
+
+TIR1_reference_groups = c("WT","none")  #the first reference group lets us calculate p values for differences between WT and other variants
+                                        #the second reference group lets us calculate p values for overall effect of each variant
+AID_repeats = c(1,3);
+
+multiple_regs = lapply(TIR1_reference_groups,function(TIR1_reference_group){
+    res = lapply(AID_repeats,function(AID_repeat){
+  
+  
+    annots_ontarget = annotations_aie[Biological_replicate==1 &Day==1& (Promoter=="eft3p"& daf2AID==AID_repeat | Strain=="QZ0"),]
+    genes_to_exclude = c("TIR1-DERNBERG")
+    counts_ontarget= counts[ rownames(counts)%!in%genes_to_exclude,annots_ontarget$Sample]
+    nf_ontarget <- calculateSumFactors(counts_ontarget)
+    
+    annots_ontarget$AuxinType = relevel(factor(annots_ontarget$AuxinType),ref="wo")
+    annots_ontarget$TIR1_actived = relevel(factor(ifelse(annots_ontarget$AuxinType!="wo" &  annots_ontarget$Strain!="QZ0",
+                                                         "active","not_active")),ref="not_active")
+    
+    
+   # annots_ontarget$TIR1_actived = relevel(factor(ifelse(annots_ontarget$AuxinType!="wo" &  annots_ontarget$Strain!="QZ0",
+   #                                                      "active","not_active")),ref="active")
+    
+    #annots_ontarget$Tir1_present = relevel(factor(ifelse(!is.na(annots_ontarget$Tir1),"TIR1","none")),ref="none")
+    annots_ontarget$Tir1_variant = relevel(factor(ifelse(!is.na(annots_ontarget$Tir1),annots_ontarget$Tir1,"none")),ref=TIR1_reference_group)
+    
+    if (TIR1_reference_group == "WT"){
+      #we make a dummy variable to measure the "activated" state of the TIR1s
+      #irrespective of the compound used to activate them.
+      #there is no 'active' state for QZ0 wild-type animals, so we need to remove the 
+      #interaction term for this level ( Tir1_variantnone:TIR1_activedactive) from the model matrix
+      m1 <- model.matrix(~ AuxinType+Tir1_variant*TIR1_actived, annots_ontarget)
+    }else{
+      #we can use the auxin type in the cross model with no dummy variable
+      #but we have to remove the remove the 
+      #interaction terms for the TIR1 variant * compound combinations not tested.
+        m1 <- model.matrix(~ AuxinType*Tir1_variant, annots_ontarget)
+    }
+    all.zero <- apply(m1, 2, function(x) all(x==0))
+    if (any(all.zero)){
+      m2 = m1[,-which(all.zero)]
+    }else m2 = m1
+    
+    
+    #print((annots_ontarget[,.(AuxinType, Tir1_variant,TIR1_actived)]))
+    #stop()
+    #dds_aux_other_variants_vs_F79= DESeqDataSetFromMatrix(countData = counts_ontarget,
+    #                                     colData = annots_ontarget,
+     #                                    design = ~ AuxinType+Tir1_variant*TIR1_actived
+    #                                     )
+    
+    
+    dds_aux_other_variants_vs_F79= DESeqDataSetFromMatrix(countData = counts_ontarget,
+                                         colData = annots_ontarget,
+                                         design = m2
+                                         )
+    
+    sizeFactors(dds_aux_other_variants_vs_F79) <- nf_ontarget # use scran normalization
+    dds_aux_other_variants_vs_F79 <- estimateDispersions(dds_aux_other_variants_vs_F79) # estimate overdispersion parameter
+    dds_aux_other_variants_vs_F79 <- nbinomWaldTest(dds_aux_other_variants_vs_F79,modelMatrix=m2) # run NB GLM and do Wald Test on coefficients
+    
+    results_aux_other_variants_vs_F79 <- lapply(resultsNames(dds_aux_other_variants_vs_F79), function(i) {
+      r <- results(dds_aux_other_variants_vs_F79, name = i)
+      r <- as.data.table(r)
+      colnames(r) <- paste0(i, "_", colnames(r))
+      r
+    })
+    
+    results_aux_other_variants_vs_F79_long <- rbindlist(lapply(resultsNames(dds_aux_other_variants_vs_F79), function(i) {
+      r <- results(dds_aux_other_variants_vs_F79, name = i)
+      r <- as.data.table(r)
+      r[, GeneName := rownames(counts_ontarget)]
+      r$covariate = i
+      r
+    }))
+    results_aux_other_variants_vs_F79_long = results_aux_other_variants_vs_F79_long[covariate != "Intercept",]
+  #  results_aux_other_variants_vs_F79_long[,group:=substring(covariate,0,lapply(gregexpr("_vs",covariate),function(x)x[1]-1))]
+   results_aux_other_variants_vs_F79_long[,group:=covariate]
+    results_aux_other_variants_vs_F79_long[is.na(padj),padj:=1]
+    results_aux_other_variants_vs_F79_long_logFC = dcast(results_aux_other_variants_vs_F79_long,GeneName~group,value.var="log2FoldChange")
+    results_aux_other_variants_vs_F79_long_padj = dcast(results_aux_other_variants_vs_F79_long,GeneName~group,value.var="padj")
+    results_aux_other_variants_vs_F79_wide = merge(results_aux_other_variants_vs_F79_long_logFC,results_aux_other_variants_vs_F79_long_padj,by="GeneName",suffixes=c(".logFC",".padj"))
+    
+    list(long = results_aux_other_variants_vs_F79_long,wide=results_aux_other_variants_vs_F79_wide)
+    })
+    names(res) = paste0(AID_repeats,"x")
+    res
+})
+names(multiple_regs) = TIR1_reference_groups;
+
+results_aux_other_variants_vs_F79_long_3xAID = multiple_regs[["WT"]][["3x"]]$long
+results_aux_other_variants_vs_F79_3xAID_wide = multiple_regs[["WT"]][["3x"]]$wide
+results_aux_other_variants_vs_F79_long_3xAID_abs = multiple_regs[["none"]][["3x"]]$long
+results_aux_other_variants_vs_F79_3xAID_wide_abs = multiple_regs[["none"]][["3x"]]$wide
+
+
+
+results_aux_other_variants_vs_F79_long = multiple_regs[["WT"]][["1x"]]$long
+results_aux_other_variants_vs_F79_wide = multiple_regs[["WT"]][["1x"]]$wide
+results_aux_other_variants_vs_F79_long_abs = multiple_regs[["none"]][["1x"]]$long
+results_aux_other_variants_vs_F79_wide_abs = multiple_regs[["none"]][["1x"]]$wide
+
+```
+
+```{r}
+#compare the effects of different variants to each other, accounting for the "off-target" effects of compounds
+#y = B_compound + B_TIR1 + e
+#for 1x degrons
+
+#this is good and important because there are effects of the compounds that are removed by adding TIR1, and modelling B_compound
+#as consistent across all conditions excludes these.
+#BUT THIS IS BAD BECAUSE IT MODELS the TIR1 effects as consistent with or without compound!  We need to run the cross term model as done above.
+if (0){
+TIR1_variants = c("WT","F79G","F79A")
+AID_repeats = c(1,3);
+
+multiple_regs = lapply(TIR1_variants,function(TIR1_variant){
+    res = lapply(AID_repeats,function(AID_repeat){
+    compound = annotations_aie[Tir1==TIR1_variant,AuxinType]
+    
+    annots_ontarget = annotations_aie[Biological_replicate==1 &Day==1& AuxinType%in% c(compound,"wo") & (Promoter == "eft3p" & Tir1 == TIR1_variant & daf2AID==AID_repeat | Strain=="QZ0"),]
+
+    genes_to_exclude = c("TIR1-DERNBERG")
+    counts_ontarget= counts[ rownames(counts)%!in%genes_to_exclude,annots_ontarget$Sample]
+    nf_ontarget <- calculateSumFactors(counts_ontarget)
+    
+    annots_ontarget$AuxinType = relevel(factor(annots_ontarget$AuxinType),ref="wo")
+    #annots_ontarget$Tir1_present = relevel(factor(ifelse(!is.na(annots_ontarget$Tir1),"TIR1","none")),ref="none")
+    annots_ontarget$Tir1_variant = relevel(factor(ifelse(!is.na(annots_ontarget$Tir1),annots_ontarget$Tir1,"none")),ref="none")
+    
+    
+    #View(annots_ontarget[,.(AuxinType, Tir1_variant,Genotype)])
+    #stop()
+    dds_aux_other_variants_vs_F79= DESeqDataSetFromMatrix(countData = counts_ontarget,
+                                         colData = annots_ontarget,
+                                         design = ~ AuxinType*Tir1_variant
+                                         )
+    sizeFactors(dds_aux_other_variants_vs_F79) <- nf_ontarget # use scran normalization
+    dds_aux_other_variants_vs_F79 <- estimateDispersions(dds_aux_other_variants_vs_F79) # estimate overdispersion parameter
+    dds_aux_other_variants_vs_F79 <- nbinomWaldTest(dds_aux_other_variants_vs_F79) # run NB GLM and do Wald Test on coefficients
+    
+    results_aux_other_variants_vs_F79 <- lapply(resultsNames(dds_aux_other_variants_vs_F79), function(i) {
+      r <- results(dds_aux_other_variants_vs_F79, name = i)
+      r <- as.data.table(r)
+      colnames(r) <- paste0(i, "_", colnames(r))
+      r
+    })
+    
+    results_aux_other_variants_vs_F79_long <- rbindlist(lapply(resultsNames(dds_aux_other_variants_vs_F79), function(i) {
+      r <- results(dds_aux_other_variants_vs_F79, name = i)
+      r <- as.data.table(r)
+      r[, GeneName := rownames(counts_ontarget)]
+      r$covariate = i
+      r
+    }))
+    results_aux_other_variants_vs_F79_long = results_aux_other_variants_vs_F79_long[covariate != "Intercept",]
+    results_aux_other_variants_vs_F79_long[,group:=substring(covariate,0,lapply(gregexpr("_vs",covariate),function(x)x[1]-1))]
+    results_aux_other_variants_vs_F79_long[is.na(padj),padj:=1]
+    results_aux_other_variants_vs_F79_long_logFC = dcast(results_aux_other_variants_vs_F79_long,GeneName~group,value.var="log2FoldChange")
+    results_aux_other_variants_vs_F79_long_padj = dcast(results_aux_other_variants_vs_F79_long,GeneName~group,value.var="padj")
+    results_aux_other_variants_vs_F79_wide = merge(results_aux_other_variants_vs_F79_long_logFC,results_aux_other_variants_vs_F79_long_padj,by="GeneName",suffixes=c(".logFC",".padj"))
+    
+    annots_activated_TIR1 = annots_ontarget[AuxinType==compound) & (Promoter == "eft3p" & Tir1 == TIR1_variant & daf2AID==AID_repeat | Strain=="QZ0"),]
+
+    list(long = results_aux_other_variants_vs_F79_long,wide=results_aux_other_variants_vs_F79_wide)
+    })
+    names(res) = paste0(AID_repeats,"x")
+    res
+})
+names(multiple_regs) = TIR1_variants;
+
+results_aux_other_variants_vs_F79_long_3xAID = multiple_regs[["WT"]][["3x"]]$long
+results_aux_other_variants_vs_F79_3xAID_wide = multiple_regs[["WT"]][["3x"]]$wide
+results_aux_other_variants_vs_F79_long_3xAID_abs = multiple_regs[["none"]][["3x"]]$long
+results_aux_other_variants_vs_F79_3xAID_wide_abs = multiple_regs[["none"]][["3x"]]$wide
+
+
+
+results_aux_other_variants_vs_F79_long = multiple_regs[["WT"]][["1x"]]$long
+results_aux_other_variants_vs_F79_wide = multiple_regs[["WT"]][["1x"]]$wide
+results_aux_other_variants_vs_F79_long_abs = multiple_regs[["none"]][["1x"]]$long
+results_aux_other_variants_vs_F79_wide_abs = multiple_regs[["none"]][["1x"]]$wide
+}
+
+```
+
+```{r}
+library(ggVennDiagram)
+sig = .0001
+mag_cutoff =  log2(1.5)
+
+#relative
+#y = cC + aA + tT + xAT
+#c is the effect of each compound relative to no compound
+#a is the effect of activating Tir1 (relative to unactivated F79)
+#t is the TIR1 variant effect relative to F79 (independent of activation status)
+#x is the effect of activating the tir1 variant relative to activated F79
+#absolute
+#y = cC + tT + xcT
+#c is the effect of each compound relative to no compound 
+#t is the TIR1 variant effect relative to N2 (independent of activation status)
+#x is the effect of activating the tir1 variant relative to unactivated N2
+
+
+
+shared_all = results_aux_other_variants_vs_F79_3xAID_wide[(TIR1_activedactive.padj < sig | Tir1_variantnone.padj < sig) &        #sig effect in F79
+                                                      abs(-Tir1_variantnone.logFC+TIR1_activedactive.logFC)>=mag_cutoff &   #large effect in F79
+                                                      (Tir1_variantF79G.TIR1_activedactive.padj >= sig |                    #no sig difference in F79G
+                                                      sign(Tir1_variantF79G.logFC + Tir1_variantF79G.TIR1_activedactive.logFC) == sign(TIR1_activedactive.logFC)  #or F79G has the same effect but larger
+                                                      ) &
+                                                      (Tir1_variantF79A.TIR1_activedactive.padj >= sig |  #no sig difference in F79G
+                                                      sign(Tir1_variantF79A.logFC + Tir1_variantF79A.TIR1_activedactive.logFC) == sign(TIR1_activedactive.logFC)) #or F79G has the same effect but larger
+                                                      ,GeneName]
+  
+
+                                                                                                                                                
+                                                                                                                                                
+unique_to_F79G = setdiff(
+                            results_aux_other_variants_vs_F79_3xAID_wide_abs[abs(Tir1_variantF79G.logFC+AuxinType5ph.Tir1_variantF79G.logFC)>=mag_cutoff & #large, significant effect in F79G
+                                                                         (Tir1_variantF79G.padj < sig | AuxinType5ph.Tir1_variantF79G.padj < sig),GeneName],
+                         shared_all)  #but not shared
+
+unique_to_F79A = setdiff(
+                            results_aux_other_variants_vs_F79_3xAID_wide_abs[abs(Tir1_variantF79A.logFC+AuxinType5ad.Tir1_variantF79A.logFC)>=mag_cutoff & #large significant effect in F79A
+                                                                         (Tir1_variantF79A.padj < sig | AuxinType5ad.Tir1_variantF79A.padj < sig),GeneName],
+                         shared_all)  #but not shared
+unique_to_F79 = setdiff(
+                            results_aux_other_variants_vs_F79_3xAID_wide_abs[abs(Tir1_variantWT.logFC+AuxinTypeAux.Tir1_variantWT.logFC)>=mag_cutoff & #large significant effect in F79
+                                                                         (Tir1_variantWT.padj < sig | AuxinTypeAux.Tir1_variantWT.padj < sig),GeneName], 
+
+                                                     shared_all) #but not shared
+all_eft3_genes = unique(results_aux_other_variants_vs_F79_3xAID_wide_abs[,GeneName])
+
+grps = list(F79=c(shared_all,unique_to_F79),
+            F79A=c(shared_all,unique_to_F79A),
+            F79G=c(shared_all,unique_to_F79G))
+colors = c("black","#64C5EB","#E84D8A")
+TIR1_targets_vd = ggVennDiagram(grps, 
+              label_alpha=0, 
+              set_color = colors,
+              label="count")+
+            ggplot2::scale_fill_gradient(low = "white", high = "white")+theme(legend.position="none")+scale_x_continuous(expand = expansion(mult = 1.1))
+TIR1_targets_vd
+
+if(0){ #debugging, making sure the regressions all match up
+
+tbll = merge(results_aux_other_variants_vs_F79_3xAID_wide[,.(GeneName,TIR1_activedactive.padj)],results_aux_other_variants_vs_F79_3xAID_wide_abs[,.(GeneName,AuxinTypeAux.Tir1_variantWT.padj)])
+plot(tbll$TIR1_activedactive.padj,tbll$AuxinTypeAux.Tir1_variantWT.padj)
+
+
+tbll = merge(results_aux_other_variants_vs_F79_3xAID_wide[,.(GeneName,-Tir1_variantnone.logFC+TIR1_activedactive.logFC)],results_aux_other_variants_vs_F79_3xAID_wide_abs[,.(GeneName,Tir1_variantWT.logFC+AuxinTypeAux.Tir1_variantWT.logFC)])
+summary(lm(V2.y~V2.x,data=tbll))
+plot(tbll$V2.x,tbll$V2.y)
+}
+
+```
+
+```{r}
+#compare the effects of TIR1 promotoer on TIR1[F79], accounting for the "off-target" effects of compounds
+#y = B_compound*B_TIR1 + e
+
+
+#this is good and important because there are effects of the compounds that are removed by adding TIR1, and modelling B_compound
+#as consistent across all conditions excludes these.
+
+
+promoter_reference_groups = c("eft3p 3xAID","wo 0xAID")  #the first reference group lets us calculate p values for differences between WT and other variants
+                                        #the second reference group lets us calculate p values for overall effect of each variant
+
+multiple_regs_promoter = lapply(promoter_reference_groups,function(promoter_reference_group){
+  
+    annots_ontarget = annotations_aie[Biological_replicate==1 &Day==1& (Tir1== "WT" | Strain=="QZ0"),]
+  
+    genes_to_exclude = c("TIR1-DERNBERG")
+    counts_ontarget= counts[ rownames(counts)%!in%genes_to_exclude,annots_ontarget$Sample]
+    nf_ontarget <- calculateSumFactors(counts_ontarget)
+    
+    annots_ontarget$AuxinType = relevel(factor(annots_ontarget$AuxinType),ref="wo")
+    #annots_ontarget$Tir1_present = relevel(factor(ifelse(!is.na(annots_ontarget$Tir1),"TIR1","none")),ref="none")
+    annots_ontarget$Tir1_promoter = relevel(factor(paste0(annots_ontarget$Promoter," ",annots_ontarget$daf2AID,"xAID")),ref=promoter_reference_group)
+    annots_ontarget$TIR1_actived = relevel(factor(ifelse(annots_ontarget$AuxinType!="wo" &  annots_ontarget$Strain!="QZ0",
+                                                         "active","not_active")),ref="not_active")
+    
+    if (promoter_reference_group == "eft3p 3xAID"){
+      #we make a dummy variable to measure the "activated" state of the TIR1s
+      #irrespective of the compound used to activate them.
+      #there is no 'active' state for QZ0 wild-type animals, so we need to remove the 
+      #interaction term for this level ( Tir1_variantnone:TIR1_activedactive) from the model matrix
+      m1 <- model.matrix(~ AuxinType+TIR1_actived*Tir1_promoter, annots_ontarget)
+    }else{
+      #we can use the auxin type in the cross model with no dummy variable
+      #but we have to remove the remove the 
+      #interaction terms for the TIR1 variant * compound combinations not tested.
+        m1 <- model.matrix(~ AuxinType*Tir1_promoter, annots_ontarget)
+    }
+    all.zero <- apply(m1, 2, function(x) all(x==0))
+    if (any(all.zero)){
+      m2 = m1[,-which(all.zero)]
+    }else m2 = m1
+    
+    
+    
+    dds_aux_other_variants_vs_F79= DESeqDataSetFromMatrix(countData = counts_ontarget,
+                                         colData = annots_ontarget,
+                                         design = m2
+                                         )
+    sizeFactors(dds_aux_other_variants_vs_F79) <- nf_ontarget # use scran normalization
+    dds_aux_other_variants_vs_F79 <- estimateDispersions(dds_aux_other_variants_vs_F79) # estimate overdispersion parameter
+    dds_aux_other_variants_vs_F79 <- nbinomWaldTest(dds_aux_other_variants_vs_F79,modelMatrix=m2) # run NB GLM and do Wald Test on coefficients
+    
+    results_aux_other_variants_vs_F79 <- lapply(resultsNames(dds_aux_other_variants_vs_F79), function(i) {
+      r <- results(dds_aux_other_variants_vs_F79, name = i)
+      r <- as.data.table(r)
+      colnames(r) <- paste0(i, "_", colnames(r))
+      r
+    })
+    
+    results_aux_other_variants_vs_F79_long <- rbindlist(lapply(resultsNames(dds_aux_other_variants_vs_F79), function(i) {
+      r <- results(dds_aux_other_variants_vs_F79, name = i)
+      r <- as.data.table(r)
+      r[, GeneName := rownames(counts_ontarget)]
+      r$covariate = i
+      r
+    }))
+    results_aux_other_variants_vs_F79_long = results_aux_other_variants_vs_F79_long[covariate != "Intercept",]
+    results_aux_other_variants_vs_F79_long[,group:=covariate]
+    results_aux_other_variants_vs_F79_long[is.na(padj),padj:=1]
+    results_aux_other_variants_vs_F79_long_logFC = dcast(results_aux_other_variants_vs_F79_long,GeneName~group,value.var="log2FoldChange")
+    results_aux_other_variants_vs_F79_long_padj = dcast(results_aux_other_variants_vs_F79_long,GeneName~group,value.var="padj")
+    results_aux_other_variants_vs_F79_wide = merge(results_aux_other_variants_vs_F79_long_logFC,results_aux_other_variants_vs_F79_long_padj,by="GeneName",suffixes=c(".logFC",".padj"))
+    
+    list(long = results_aux_other_variants_vs_F79_long,wide=results_aux_other_variants_vs_F79_wide)
+
+})
+names(multiple_regs_promoter) = promoter_reference_groups;
+
+
+results_aux_promoter_long = multiple_regs_promoter[["eft3p 3xAID"]]$long
+results_aux_promoter_wide = multiple_regs_promoter[["eft3p 3xAID"]]$wide
+results_aux_promoter_long_abs = multiple_regs_promoter[["wo 0xAID"]]$long
+results_aux_promoter_wide_abs = multiple_regs_promoter[["wo 0xAID"]]$wide
+
+```
+
+
+```{r,fig.width=10,fig.height=10}
+
+library(nlstools)
+library(ggrastr)
+library(robustbase)
+
+sig = .0001
+mag_cutoff =  log2(1.5)
+
+
+#plot the 'on-target' effects of the activated auxin system COMPARING TIR1 variants
+data_df = results_aux_other_variants_vs_F79_3xAID_wide_abs
+
+
+#y = cC + aA + tT + xAT
+#c is the effect of each compound relative to no compound
+#a is the effect of activating Tir1 (relative to unactivated F79)
+#t is the TIR1 variant effect relative to F79 (independent of activation status)
+#x is the effect of activating the tir1 variant relative to activated F79
+
+#"on target effect" = aA + tT + xAT
+
+if (1){ #include variant effects in addition to activated variant effects
+data_df[,F79A.logFC:=Tir1_variantF79A.logFC+AuxinType5ad.Tir1_variantF79A.logFC]
+data_df[,F79G.logFC:=Tir1_variantF79G.logFC+AuxinType5ph.Tir1_variantF79G.logFC]
+data_df[,F79.logFC:=Tir1_variantWT.logFC + AuxinTypeAux.Tir1_variantWT.logFC]
+}else{
+data_df[,F79A.logFC:=AuxinType5ad.Tir1_variantF79A.logFC]
+data_df[,F79G.logFC:=AuxinType5ph.Tir1_variantF79G.logFC]
+data_df[,F79.logFC:= AuxinTypeAux.Tir1_variantWT.logFC]
+}
+
+data_df[,F79A.padj:=pmin(Tir1_variantF79A.padj,AuxinType5ad.Tir1_variantF79A.padj)]
+data_df[,F79G.padj:=pmin(Tir1_variantF79G.padj,AuxinType5ph.Tir1_variantF79G.padj)]
+data_df[,F79.padj:=pmin(Tir1_variantWT.padj,AuxinTypeAux.Tir1_variantWT.padj)]
+
+
+results_aux_ontarget_wide_all3_melt = melt(data_df,id.vars=c("GeneName","F79.logFC"),measure.vars=c("F79A.logFC","F79G.logFC"))
+
+results_aux_ontarget_wide_all3_melt[,value := value]  #because the regression is set up relative to F79 and we need to flip the signs so the effects are WT->F79
+
+results_aux_ontarget_wide_all3_melt[,TIR1:=substring(as.character(variable),0,4)]
+
+results_aux_ontarget_wide_all3_melt_padj=
+melt(data_df,id.vars=c("GeneName","F79.padj"),measure.vars=c("F79A.padj","F79G.padj"))
+results_aux_ontarget_wide_all3_melt_padj[,TIR1:=substring(as.character(variable),0,4)]
+
+results_aux_ontarget_wide_all3_melt_both = merge(results_aux_ontarget_wide_all3_melt,results_aux_ontarget_wide_all3_melt_padj,by=c("GeneName","TIR1"),suffixes=c(".logFC",".padj"))
+
+names(results_aux_ontarget_wide_all3_melt_both)[names(results_aux_ontarget_wide_all3_melt_both)=="F79.logFC"] = "WT.logFC"
+names(results_aux_ontarget_wide_all3_melt_both)[names(results_aux_ontarget_wide_all3_melt_both)=="F79.padj"] = "WT.padj"
+
+gene_set_lookup = data.table(GeneName = unique(results_aux_ontarget_wide_all3_melt_both$GeneName));
+gene_set_lookup[,F79A:=GeneName%in%unique_to_F79A]
+gene_set_lookup[,F79G:=GeneName%in%unique_to_F79G]
+gene_set_lookup[,F79:=GeneName%in%unique_to_F79]
+gene_set_lookup[,shared_all:=GeneName%in%shared_all]
+setkey(gene_set_lookup,GeneName)
+#results_aux_ontarget_wide_all3_melt_both$GN = results_aux_ontarget_wide_all3_melt_both$GeneName
+
+results_aux_ontarget_wide_all3_melt_both[,significance := ifelse(TIR1=="F79A",
+                                                                 ifelse(gene_set_lookup[GeneName,F79==T & F79A==T | shared_all==T],
+                                                                 "Both",
+                                                                 ifelse(gene_set_lookup[GeneName,F79==T],"F79",
+                                                                        ifelse(gene_set_lookup[GeneName,F79A==T],TIR1,
+                                                                               "Neither"))), 
+                                                                 ifelse(gene_set_lookup[GeneName,F79==T & F79G==T| shared_all==T],
+                                                                 "Both",
+                                                                 ifelse(gene_set_lookup[GeneName,F79==T],"F79",
+                                                                        ifelse(gene_set_lookup[GeneName,F79G==T],TIR1,
+                                                                               "Neither"))))]
+
+
+colors = c("black","green","#64C5EB","#E84D8A","white")
+names(colors) = c("Both","F79","F79A","F79G","Neither")
+sig_genes =  data_df[F79A.padj < sig | F79.padj < sig | F79G.padj<sig,GeneName]
+results_aux_ontarget_wide_all3_melt_both_sig = results_aux_ontarget_wide_all3_melt_both;#[GeneName %in% sig_genes,]
+axis_lims = range(c(results_aux_ontarget_wide_all3_melt_both_sig$WT.logFC,results_aux_ontarget_wide_all3_melt_both_sig$value.logFC))
+#unique(res_l_a[,.(significance,colors[significance])])
+#cr =cor(res_l_a$label_auxin_vs_none.log2FC,res_l_a$variant_specific.log2FC)
+  
+
+colors = c("black","gray","green","#64C5EB","#E84D8A")
+names(colors) = c("Both","Neither","F79","Different in F79A","Different in F79G")
+
+r_temp = results_aux_ontarget_wide_all3_melt_both_sig[TIR1=="F79A",]
+
+r_temp[,g:=2^(WT.logFC)]
+r_temp[,a:=2^(value.logFC)]
+rfit = r_temp[significance!="Neither",];
+
+ 
+lm_res = nlrob(a~g^c2,start=list(c2=4),data=rfit,method="MM",lower=c(c2=.1),upper=c(c2=10))
+
+m1=(coefficients(lm_res)["c2"])
+icp1 = 0
+#sd=confint2(lm_res,parm=c("c2"))
+sd = m1+ c(-1,1)*summary(lm_res)$coefficients[2]
+slope_str = paste0(round(m1,2)," (",round(sd[1],2),",",round(sd[2],2),")")
+
+
+
+#r_temp$residual = residuals(lm_res)
+#r_temp[significance%in%c("Both","F79"), significance:= "F79"]
+r_temp[significance%in%c("F79A","F79G"), significance:= paste("Different in",significance)]
+
+  
+axis_lims = range(c(results_aux_ontarget_wide_all3_melt_both_sig$WT.logFC,+results_aux_ontarget_wide_all3_melt_both_sig$value.logFC))
+
+cr =cor(r_temp$WT.logFC,r_temp$value.logFC)
+g_a=ggplot(r_temp,aes(WT.logFC,value.logFC,color=significance)) + 
+  geom_abline(intercept=icp1,slope=m1,color="#537D5D",linewidth=1.5)+
+   #geom_smooth(data=r_temp[!significance%in% c("Neither"),],method="glm",se=F,aes(color=NULL),color="#537D5D", method.args =list(family=gaussian(link="identity")))+
+  geom_hline(yintercept=0,color="grey",lty=2)+
+  geom_vline(xintercept=0,color="grey",lty=2)+
+  geom_point_rast(data=r_temp[significance=="Neither"],aes(fill=significance),pch=21,color="black",alpha=.3,raster.dpi=600) +  
+  geom_point_rast(data=r_temp[significance!="Neither"],aes(fill=significance),pch=21,color="black",alpha=.7,raster.dpi=600) +  
+  geom_abline(intercept=0,slope=1,lty=2,col="dark gray")+ 
+ # geom_abline(intercept=0,slope=-1,lty=2,col="dark gray")+
+  ylab("TIR1[F79A] effect (log2 fold-change)")+
+  xlab("TIR1[F79] effect (log2 fold-change)")+ 
+  scale_fill_manual(values=colors)+
+  scale_color_manual(values=colors)+
+  xlim(axis_lims[1],axis_lims[2])+ylim(axis_lims[1],axis_lims[2])+
+  annotate("text",label=paste0("rho=",round(cr,2),"\nB=",slope_str),x=axis_lims[1]*3/4,y=axis_lims[2]*3/4)+
+  theme(legend.position="none")
+
+r_temp = results_aux_ontarget_wide_all3_melt_both_sig[TIR1=="F79G",]
+
+r_temp[,g:=2^(WT.logFC)]
+r_temp[,a:=2^(value.logFC)]
+rfit = r_temp[significance!="Neither",];
+
+ 
+lm_res = nlrob(a~g^c2,start=list(c2=4),data=rfit,method="MM",lower=c(c2=.1),upper=c(c2=10))
+
+m2=(coefficients(lm_res)["c2"])
+icp2 = 0
+#sd=confint2(lm_res,parm=c("c2"))
+sd = m2+ c(-1,1)*summary(lm_res)$coefficients[2]
+slope_str = paste0(round(m2,2)," (",round(sd[1],2),",",round(sd[2],2),")")
+#r_temp$residual = residuals(lm_res)
+#r_temp[significance%in%c("Both","F79"), significance:= "F79"]
+r_temp[significance%in%c("F79A","F79G"), significance:= paste("Different in",significance)]
+
+
+cr =cor(r_temp$WT.logFC,r_temp[,+value.logFC])
+g_g=ggplot(r_temp,aes(WT.logFC,value.logFC,color=significance)) + 
+    
+  geom_abline(intercept=icp2,slope=m2,color="#537D5D",linewidth=1.5)+
+  #geom_smooth(data=r_temp[!significance%in% c("Neither"),],method="glm",se=F,aes(color=NULL),color="#537D5D", method.args =list(family=gaussian(link="identity")))+
+  geom_hline(yintercept=0,color="grey",lty=2)+
+  geom_vline(xintercept=0,color="grey",lty=2)+
+  geom_point_rast(data=r_temp[significance=="Neither"],aes(fill=significance),pch=21,color="black",alpha=.3,raster.dpi=600) +  
+  geom_point_rast(data=r_temp[significance!="Neither"],aes(fill=significance),pch=21,color="black",alpha=.7,raster.dpi=600) +  
+  geom_abline(intercept=0,slope=1,lty=2,col="dark gray")+ 
+ # geom_abline(intercept=0,slope=-1,lty=2,col="dark gray")+
+   ylab("TIR1[F79G] effect (log2 fold-change)")+
+  xlab("TIR1[F79] effect (log2 fold-change)")+ 
+  scale_fill_manual(values=colors)+
+  scale_color_manual(values=colors)+
+  xlim(axis_lims[1],axis_lims[2])+ylim(axis_lims[1],axis_lims[2])+
+  annotate("text",label=paste0("rho=",round(cr,2),"\nB=",slope_str),x=axis_lims[1]*3/4,y=axis_lims[2]*3/4)+
+  theme(legend.position="none")
+
+
+
+
+r_temp = data_df
+
+
+
+
+r_temp[,significance :=  ifelse(gene_set_lookup[GeneName,F79G==T & F79A==T & shared_all!=T],
+                                                                 "Different in both F79G and F79A",
+                                                                 ifelse(gene_set_lookup[GeneName,F79G==T & shared_all!=T],"Different in F79G",
+                                                                 ifelse(gene_set_lookup[GeneName,F79A==T & shared_all!=T],"Different in F79A",
+                                                                 ifelse(gene_set_lookup[GeneName,F79==T & shared_all!=T],"F79",
+                                                                               "Neither"))))]
+
+r_temp[,g:=2^(F79G.logFC)]
+r_temp[,a:=2^(F79A.logFC)]
+rfit = r_temp[significance!="Neither",];
+
+ 
+lm_res = nlrob(a~g^c2,start=list(c2=4),data=rfit,method="MM",lower=c(c2=.1),upper=c(c2=10))
+
+m3=(coefficients(lm_res)["c2"])
+icp3 = 0
+#sd=confint2(lm_res,parm=c("c2"))
+sd = m3+ c(-1,1)*summary(lm_res)$coefficients[2]
+slope_str = paste0(round(m3,2)," (",round(sd[1],2),",",round(sd[2],2),")")
+#g = seq(min(rfit$g),max(rfit$g),length.out=2000)
+#a = g^m3;
+#plot(rfit$g,rfit$a,log="xy")
+#lines(g,a,col="red")
+
+#plot(rfit$g,rfit$a)
+#lines(g,a,col="red")
+
+axis_lims = range(c(r_temp$F79A.logFC,r_temp$F79G.logFC,r_temp$F79.logFC))
+
+colors = c("grey","black","#64C5EB","#E84D8A","lightgreen")
+names(colors) = c("Neither","F79","Different in F79A","Different in F79G","Different in both F79G and F79A")
+
+
+cr =cor(r_temp$F79A.logFC, r_temp$F79G.logFC)
+g_ag=ggplot(r_temp,aes(F79G.logFC,F79A.logFC,color=significance)) + 
+  geom_abline(intercept=icp3,slope=m3,color="#537D5D",linewidth=1.5)+
+ # geom_smooth(data=r_temp[!significance%in% c("F79","Neither"),],method="glm",se=F,aes(color=NULL),color="#537D5D", method.args =list(family=gaussian(link="identity")))+
+  geom_hline(yintercept=0,color="grey",lty=2)+
+  geom_vline(xintercept=0,color="grey",lty=2)+
+  geom_point_rast(data=r_temp[significance=="Neither"],aes(fill=significance),pch=21,color="black",alpha=.3,raster.dpi=600) +  
+  geom_point_rast(data=r_temp[significance!="Neither"],aes(fill=significance),pch=21,color="black",alpha=.7,raster.dpi=600) +  
+  geom_abline(intercept=0,slope=1,lty=2,col="dark gray")+ 
+ # geom_abline(intercept=0,slope=-1,lty=2,col="dark gray")+
+   ylab("TIR1[F79A] effect (log2 fold-change)")+
+  xlab("TIR1[F79G] effect (log2 fold-change)")+ 
+  scale_fill_manual(values=colors)+
+  scale_color_manual(values=colors)+
+  xlim(axis_lims[1],axis_lims[2])+ylim(axis_lims[1],axis_lims[2])+
+  annotate("text",label=paste0("rho=",round(cr,2),"\nB=",slope_str),x=axis_lims[1]*3/4,y=axis_lims[2]*3/4)+
+  theme(legend.position="none")
+
+
+
+
+ggpubr::ggarrange(plotlist=list(g_a,g_g,g_ag,TIR1_targets_vd),nrow=1,ncol=4)
+ggsave("TIR1_auxin_dependent_effects_redux_considering_compound_effect.pdf",width=20,height=5)
+
+
+#ggpubr::ggarrange(plotlist=list(g_a_resid,g_g_resid),nrow=1,ncol=2)
+```
+
+```{r}
+#promoter effects
+library(ggVennDiagram)
+
+sig = .0001
+mag_cutoff =  log2(1.5)
+
+#relative
+#y = cC + aA + tT + xAT
+#c is the effect of each compound relative to no compound
+#a is the effect of activating Tir1 (relative to unactivated F79)
+#t is the TIR1 variant effect relative to F79 (independent of activation status)
+#x is the effect of activating the tir1 variant relative to activated F79
+#absolute
+#y = cC + tT + xcT
+#c is the effect of each compound relative to no compound 
+#t is the TIR1 variant effect relative to N2 (independent of activation status)
+#x is the effect of activating the tir1 variant relative to unactivated N2
+
+
+
+shared_1x_3x = results_aux_promoter_wide[(TIR1_activedactive.padj < sig | Tir1_promoterwo.0xAID.padj < sig) &        #sig effect in eif3Bp::1x
+                                                      abs(-Tir1_promoterwo.0xAID.logFC+TIR1_activedactive.logFC)>=mag_cutoff &   #large effect in eft-3p::1x
+                                                      (TIR1_activedactive.Tir1_promotereif3Bp.3xAID.padj >= sig |                    #no sig difference in F79G
+                                                      sign(Tir1_promotereif3Bp.3xAID.logFC + TIR1_activedactive.Tir1_promotereif3Bp.3xAID.logFC) == sign(TIR1_activedactive.logFC)  #or F79G has the same effect but larger
+                                                      )
+                                                      ,GeneName]
+  
+unique_to_3x = setdiff(
+                            results_aux_promoter_wide_abs[abs(Tir1_promotereif3Bp.3xAID.logFC+AuxinTypeAux.Tir1_promotereif3Bp.3xAID.logFC)>=mag_cutoff & #large, significant effect in 3x
+                                                                         (Tir1_promotereif3Bp.3xAID.padj < sig | AuxinTypeAux.Tir1_promotereif3Bp.3xAID.padj < sig),GeneName],
+                         shared_1x_3x)  #but not shared
+unique_to_1x = setdiff(
+                            results_aux_promoter_wide_abs[abs(Tir1_promotereif3Bp.1xAID.logFC+AuxinTypeAux.Tir1_promotereif3Bp.1xAID.logFC)>=mag_cutoff & #large, significant effect in 1x
+                                                                         (Tir1_promotereif3Bp.1xAID.padj < sig | AuxinTypeAux.Tir1_promotereif3Bp.1xAID.padj < sig),GeneName],
+                         shared_1x_3x)  #but not shared
+
+grps = list(DAF2_1xAID=c(shared_1x_3x,unique_to_1x),
+            DAF2_3xAID=c(shared_1x_3x,unique_to_3x))
+colors = c("black","#98cF6F")
+AID_repeate_vd = ggVennDiagram(grps, 
+              label_alpha=0, 
+              set_color = colors,
+              label="count")+
+            ggplot2::scale_fill_gradient(low = "white", high = "white")+theme(legend.position="none")+scale_x_continuous(expand = expansion(mult = 1.1))
+AID_repeate_vd
+
+
+
+
+shared_eft3_eif3b = results_aux_promoter_wide[(TIR1_activedactive.padj < sig | Tir1_promoterwo.0xAID.logFC < sig) &        #sig effect in eft-3p::1x
+                                                      abs(-Tir1_promoterwo.0xAID.logFC+TIR1_activedactive.logFC)>=mag_cutoff &   #large effect in eft-3p::1x
+                                                      (TIR1_activedactive.Tir1_promotereif3Bp.3xAID.logFC >= sig |                    #no sig difference in eif3bp
+                                                      sign(Tir1_promotereif3Bp.3xAID.logFC + TIR1_activedactive.Tir1_promotereif3Bp.3xAID.logFC) == sign(TIR1_activedactive.logFC)  #or F79G has the same effect but larger
+                                                      )
+                                                      ,GeneName]
+  
+unique_to_eif3b = setdiff(
+                            results_aux_promoter_wide_abs[abs(Tir1_promotereif3Bp.3xAID.logFC+AuxinTypeAux.Tir1_promotereif3Bp.3xAID.logFC)>=mag_cutoff & #large, significant effect in 3x
+                                                                         (Tir1_promotereif3Bp.3xAID.padj < sig | AuxinTypeAux.Tir1_promotereif3Bp.3xAID.padj < sig),GeneName],
+                         shared_eft3_eif3b)  #but not shared
+unique_to_eft3 = setdiff(
+                            results_aux_promoter_wide_abs[abs(Tir1_promotereft3p.1xAID.logFC+AuxinTypeAux.Tir1_promotereft3p.1xAID.logFC)>=mag_cutoff & #large, significant effect in 1x
+                                                                         (Tir1_promotereft3p.1xAID.padj < sig | AuxinTypeAux.Tir1_promotereft3p.1xAID.padj < sig),GeneName],
+                         shared_eft3_eif3b)  #but not shared
+
+grps = list(eft3=c(shared_eft3_eif3b,unique_to_eft3),
+            eif3.B=c(shared_eft3_eif3b,unique_to_eif3b))
+colors = c("black","#FCEA64")
+AID_promoter_vd = ggVennDiagram(grps, 
+              label_alpha=0, 
+              set_color = colors,
+              label="count")+
+            ggplot2::scale_fill_gradient(low = "white", high = "white")+theme(legend.position="none")+scale_x_continuous(expand = expansion(mult = 1.1))
+AID_promoter_vd
+
+```
+
+```{r,fig.width=10,fig.height=10}
+
+library(nlstools)
+library(ggrastr)
+library(robustbase)
+
+
+sig = .0001
+mag_cutoff =  log2(1.5)
+
+
+#plot the 'on-target' effects of the activated auxin system COMPARING TIR1 variants
+data_df = results_aux_promoter_wide_abs
+
+
+data_df[,eft3_1x.logfc:=Tir1_promotereft3p.1xAID.logFC+AuxinTypeAux.Tir1_promotereft3p.1xAID.logFC]
+data_df[,eft3_3x.logfc:=Tir1_promotereft3p.3xAID.logFC+AuxinTypeAux.Tir1_promotereft3p.3xAID.logFC]
+data_df[,eif3Bp_3x.logfc:=Tir1_promotereif3Bp.3xAID.logFC+AuxinTypeAux.Tir1_promotereif3Bp.3xAID.logFC]
+
+
+
+#y = cC + aA + tT + xAT
+#c is the effect of each compound relative to no compound
+#a is the effect of activating Tir1 (relative to unactivated F79)
+#t is the promoter+daf-2 effect relative to eft3 (independent of activation status)
+#x is the effect of activating the tir1 variant relative to activated F79
+
+#"on target effect" = aA + tT + xAT
+
+if (1){ #include promoter effects in addition to activated promoter effects
+
+data_df[,eft3_1x.logfc:=Tir1_promotereft3p.1xAID.logFC+AuxinTypeAux.Tir1_promotereft3p.1xAID.logFC]
+data_df[,eft3_3x.logfc:=Tir1_promotereft3p.3xAID.logFC+AuxinTypeAux.Tir1_promotereft3p.3xAID.logFC]
+data_df[,eif3Bp_1x.logfc:=Tir1_promotereif3Bp.1xAID.logFC+AuxinTypeAux.Tir1_promotereif3Bp.1xAID.logFC]
+}else{
+
+data_df[,eft3_1x.logfc:=AuxinTypeAux.Tir1_promotereft3p.1xAID.logFC]
+data_df[,eft3_3x.logfc:=AuxinTypeAux.Tir1_promotereft3p.3xAID.logFC]
+data_df[,eif3Bp_1x.logfc:=AuxinTypeAux.Tir1_promotereif3Bp.1xAID.logFC]
+}
+
+
+results_aux_ontarget_wide_all3_melt = melt(data_df,id.vars=c("GeneName","eft3_3x.logfc"),measure.vars=c("eft3_1x.logfc","eif3Bp_3x.logfc"),value.name="value.logFC")
+
+results_aux_ontarget_wide_all3_melt_both = results_aux_ontarget_wide_all3_melt
+
+gene_set_lookup = data.table(GeneName = unique(results_aux_ontarget_wide_all3_melt_both$GeneName));
+gene_set_lookup[,d1x:=GeneName%in%unique_to_1x]
+gene_set_lookup[,d3x:=GeneName%in%unique_to_3x]
+gene_set_lookup[,eif3B:=GeneName%in%unique_to_eif3b]
+gene_set_lookup[,eft3:=GeneName%in%unique_to_eft3]
+gene_set_lookup[,shared_1x_3x:=GeneName%in%shared_1x_3x]
+gene_set_lookup[,shared_eif3B_eft3:=GeneName%in%shared_eft3_eif3b]
+setkey(gene_set_lookup,GeneName)
+#results_aux_ontarget_wide_all3_melt_both$GN = results_aux_ontarget_wide_all3_melt_both$GeneName
+
+results_aux_ontarget_wide_all3_melt_both[,significance := ifelse(variable=="eft3_1x.logfc",
+                                                                 ifelse(gene_set_lookup[GeneName,d1x==T & d3x==T | shared_1x_3x==T],
+                                                                 "Both",
+                                                                 ifelse(gene_set_lookup[GeneName,d1x==T],"1xAID",
+                                                                        ifelse(gene_set_lookup[GeneName,d3x==T],"3xAID",
+                                                                               "Neither"))),
+                                                                 ifelse(gene_set_lookup[GeneName,eif3B==T & eft3==T| shared_eif3B_eft3==T],
+                                                                 "Both",
+                                                                 ifelse(gene_set_lookup[GeneName,eif3B==T],"eif3.Bp",
+                                                                        ifelse(gene_set_lookup[GeneName,eft3==T],"eft3p",
+                                                                               "Neither"))))]
+
+
+
+
+sig_genes =  unique(results_aux_ontarget_wide_all3_melt_both[significance!="Neither",GeneName])
+results_aux_ontarget_wide_all3_melt_both_sig = results_aux_ontarget_wide_all3_melt_both;#[GeneName %in% sig_genes,]
+axis_lims = range(c(results_aux_ontarget_wide_all3_melt_both_sig$eft3_1x.logfc,results_aux_ontarget_wide_all3_melt_both_sig$value.logFC))
+
+  
+colors = c("black","grey","green","#FCEA64","#98cF6F")
+names(colors) = c("Both","Neither","eft-3p","Different in eif3.Bp","Different in 1xAID")
+
+r_temp = results_aux_ontarget_wide_all3_melt_both_sig[variable=="eft3_1x.logfc",]
+
+r_temp[,a:=2^(eft3_3x.logfc)]
+r_temp[,g:=2^(value.logFC)]
+rfit = r_temp[significance!="Neither",];
+
+ 
+lm_res = nlrob(a~g^c2,start=list(c2=4),data=rfit,method="MM",lower=c(c2=.1),upper=c(c2=10))
+
+m1=(coefficients(lm_res)["c2"])
+icp1 = 0
+#sd=confint2(lm_res,parm=c("c2"))
+sd = m1+ c(-1,1)*summary(lm_res)$coefficients[2]
+slope_str = paste0(round(m1,2)," (",round(sd[1],2),",",round(sd[2],2),")")
+
+
+
+#r_temp$residual = residuals(lm_res)
+#r_temp[significance%in%c("Both","F79"), significance:= "F79"]
+r_temp[significance%in%c("1xAID","eif3.Bp"), significance:= paste("Different in",significance)]
+
+  
+axis_lims = range(c(results_aux_ontarget_wide_all3_melt_both_sig$eft3_3x.logfc,+results_aux_ontarget_wide_all3_melt_both_sig$value.logFC))
+
+cr =cor(r_temp$eft3_3x.logfc,r_temp$value.logFC)
+g_promoter=ggplot(r_temp,aes(value.logFC,eft3_3x.logfc,color=significance)) + 
+  geom_abline(intercept=icp1,slope=m1,color="#537D5D",linewidth=1.5)+
+   #geom_smooth(data=r_temp[!significance%in% c("Neither"),],method="glm",se=F,aes(color=NULL),color="#537D5D", method.args =list(family=gaussian(link="identity")))+
+  geom_hline(yintercept=0,color="grey",lty=2)+
+  geom_vline(xintercept=0,color="grey",lty=2)+
+  geom_point_rast(data=r_temp[significance=="Neither"],aes(fill=significance),pch=21,color="black",alpha=.3,raster.dpi=600) +  
+  geom_point_rast(data=r_temp[significance!="Neither"],aes(fill=significance),pch=21,color="black",alpha=.7,raster.dpi=600) +  
+  geom_abline(intercept=0,slope=1,lty=2,col="dark gray")+ 
+ # geom_abline(intercept=0,slope=-1,lty=2,col="dark gray")+
+  xlab("DAF-2::1xAID effect (log2 fold-change)")+
+  ylab("DAF-2::3xAID effect (log2 fold-change)")+ 
+  scale_fill_manual(values=colors)+
+  scale_color_manual(values=colors)+
+  xlim(axis_lims[1],axis_lims[2])+ylim(axis_lims[1],axis_lims[2])+
+  annotate("text",label=paste0("rho=",round(cr,2),"\nB=",slope_str),x=axis_lims[1]*3/4,y=axis_lims[2]*3/4)+
+  theme(legend.position="none")
+
+r_temp = results_aux_ontarget_wide_all3_melt_both_sig[variable=="eif3Bp_3x.logfc",]
+
+r_temp[,g:=2^(eft3_3x.logfc)]
+r_temp[,a:=2^(value.logFC)]
+rfit = r_temp[significance!="Neither",];
+
+ 
+lm_res = nlrob(a~g^c2,start=list(c2=4),data=rfit,method="MM",lower=c(c2=.1),upper=c(c2=10))
+
+m2=(coefficients(lm_res)["c2"])
+icp2 = 0
+#sd=confint2(lm_res,parm=c("c2"))
+sd = m2+ c(-1,1)*summary(lm_res)$coefficients[2]
+slope_str = paste0(round(m2,2)," (",round(sd[1],2),",",round(sd[2],2),")")
+#r_temp$residual = residuals(lm_res)
+#r_temp[significance%in%c("Both","F79"), significance:= "F79"]
+r_temp[significance%in%c("1xAID","eif3.Bp"), significance:= paste("Different in",significance)]
+
+
+cr =cor(r_temp$eft3_3x.logfc,r_temp[,+value.logFC])
+g_degron=ggplot(r_temp,aes(eft3_3x.logfc,value.logFC,color=significance)) + 
+    
+  geom_abline(intercept=icp2,slope=m2,color="#537D5D",linewidth=1.5)+
+  #geom_smooth(data=r_temp[!significance%in% c("Neither"),],method="glm",se=F,aes(color=NULL),color="#537D5D", method.args =list(family=gaussian(link="identity")))+
+  geom_hline(yintercept=0,color="grey",lty=2)+
+  geom_vline(xintercept=0,color="grey",lty=2)+
+  geom_point_rast(data=r_temp[significance=="Neither"],aes(fill=significance),pch=21,color="black",alpha=.3,raster.dpi=600) +  
+  geom_point_rast(data=r_temp[significance!="Neither"],aes(fill=significance),pch=21,color="black",alpha=.7,raster.dpi=600) +  
+  geom_abline(intercept=0,slope=1,lty=2,col="dark gray")+ 
+ # geom_abline(intercept=0,slope=-1,lty=2,col="dark gray")+
+   ylab("eft-3p::TIR1 effect (log2 fold-change)")+
+  xlab("eif3.Bp::TIR1 effect (log2 fold-change)")+ 
+  scale_fill_manual(values=colors)+
+  scale_color_manual(values=colors)+
+  xlim(axis_lims[1],axis_lims[2])+ylim(axis_lims[1],axis_lims[2])+
+  annotate("text",label=paste0("rho=",round(cr,2),"\nB=",slope_str),x=axis_lims[1]*3/4,y=axis_lims[2]*3/4)+
+  theme(legend.position="none")
+
+
+
+ggpubr::ggarrange(plotlist=list(g_promoter,g_degron,AID_promoter_vd,AID_repeate_vd),nrow=1,ncol=4)
+ggsave("TIR1_auxin_dependent_effects_redux_considering_compound_effect_promoter_and_degron.pdf",width=20,height=5)
+
+
+
+#ggpubr::ggarrange(plotlist=list(g_a_resid,g_g_resid),nrow=1,ncol=2)
+```
+
+```{r,fig.width=10,fig.height=10}
+
+if (0){ #old bad way of doing it
+#plot the 'on-target' effects of the activated auxin system PROMOTER EFFECT and DEGRON repeat
+tmp = results_aux_promoter_wide
+sig = .01
+mag_cutoff =  log2(2)
+
+results_aux_promoter_wide_melt_logFC = melt(tmp,id.vars=c("GeneName","Tir1_promoter_wo.0xAID.logFC"),measure.vars=c("Tir1_promoter_eif3Bp.1xAID.logFC","Tir1_promoter_eft3p.3xAID.logFC"))
+
+results_aux_promoter_wide_melt_logFC[,value := -value]  #because the regression is set up relative to eft3p and we need to flip the signs so the effects are WT->eft3p::tir1
+
+results_aux_promoter_wide_melt_logFC[,TIR1:=substring(as.character(variable),0,nchar(as.character(variable))-6)]
+
+results_aux_promoter_wide_melt_padj=
+melt(tmp,id.vars=c("GeneName","Tir1_promoter_wo.0xAID.padj"),measure.vars=c("Tir1_promoter_eif3Bp.1xAID.padj","Tir1_promoter_eft3p.3xAID.padj"))
+results_aux_promoter_wide_melt_padj[,TIR1:=substring(as.character(variable),0,nchar(as.character(variable))-5)]
+
+results_aux_promoter_wide_melt_both = merge(results_aux_promoter_wide_melt_logFC,results_aux_promoter_wide_melt_padj,by=c("GeneName","TIR1"),suffixes=c(".logFC",".padj"))
+
+results_aux_promoter_wide_melt_both[,significance := ifelse(Tir1_promoter_wo.0xAID.padj<sig & value.padj<sig & 
+                                                                   abs(Tir1_promoter_wo.0xAID.logFC) >= mag_cutoff & abs(value.logFC) >= mag_cutoff,
+                                                                 "Both",
+                                                                 ifelse(Tir1_promoter_wo.0xAID.padj<sig & abs(Tir1_promoter_wo.0xAID.logFC)>=mag_cutoff,"eft-3",
+                                                                        ifelse(value.padj<sig & abs(Tir1_promoter_wo.0xAID.logFC+value.logFC)>=mag_cutoff,substring(TIR1,15),
+                                                                               "Neither")))]
+
+colors = c("black","black","#FCEA64","#98cF6F","white")
+names(colors) = c("Both","eft-3","eif3Bp.1xAID","eft3p.3xAID" ,"Neither")
+sig_genes =  tmp[Tir1_promoter_eif3Bp.1xAID.padj < sig | Tir1_promoter_wo.0xAID.padj < sig | Tir1_promoter_eft3p.3xAID.padj<sig,GeneName]
+results_aux_promoter_wide_melt_both = results_aux_promoter_wide_melt_both;#[GeneName %in% sig_genes,]
+axis_lims = range(c(-results_aux_promoter_wide_melt_both$Tir1_promoter_wo.0xAID.logFC,results_aux_promoter_wide_melt_both$value.logFC))
+#unique(res_l_a[,.(significance,colors[significance])])
+#cr =cor(res_l_a$label_auxin_vs_none.log2FC,res_l_a$variant_specific.log2FC)
+  
+if (0){
+g_a_resid=ggplot(results_aux_promoter_wide_melt_both[TIR1=="Tir1_variant_F79A" ,],aes(Tir1_promoter_wo.0xAID.logFC,value.logFC,color=significance)) + 
+ 
+  geom_smooth(method="lm",se=F,aes(color=NULL),color="#537D5D")+
+  geom_hline(yintercept=0,color="grey",lty=2)+
+  geom_vline(xintercept=0,color="grey",lty=2)+ 
+  geom_point_rast(data=results_aux_promoter_wide_melt_both[TIR1=="Tir1_variant_F79A"  & significance=="Neither"], aes(fill=significance),pch=21,color="black",alpha=.3,raster.dpi=600)+
+  geom_point_rast(data=results_aux_promoter_wide_melt_both[TIR1=="Tir1_variant_F79A"  & significance!="Neither"], aes(fill=significance),pch=21,color="black",alpha=.7,raster.dpi=600) +  
+  geom_abline(intercept=0,slope=1,lty=2,col="dark gray")+ 
+ # geom_abline(intercept=0,slope=-1,lty=2,col="dark gray")+
+  ylab("Differential TIR1[F79A] effect (log2 fold-change)")+
+  xlab("TIR1[F79] effect (log2 fold-change)")+ 
+  scale_fill_manual(values=colors)+
+  scale_color_manual(values=colors)+
+  xlim(axis_lims[1],axis_lims[2])+ylim(axis_lims[1],axis_lims[2])+
+  theme(legend.position="none")
+  #annotate("text",label=paste0("rho=",round(cr,2)),x=axis_lims[1]*3/4,y=axis_lims[2]*3/4)
+ # annotate("text",label=paste0("rho=",round(cr,2)),x=axis_lims[1]*3/4,y=axis_lims[2]*3/4)
+
+
+g_g_resid=ggplot(results_aux_promoter_wide_melt_both[TIR1=="Tir1_variant_F79G",],aes(Tir1_variant_none.logFC,value.logFC,color=significance)) + 
+  geom_smooth(method="lm",se=F,aes(color=NULL),color="#537D5D")+
+  geom_hline(yintercept=0,color="grey",lty=2)+
+  geom_vline(xintercept=0,color="grey",lty=2)+
+  geom_point_rast(data=results_aux_promoter_wide_melt_both[TIR1=="Tir1_variant_F79G"  & significance=="Neither"], aes(fill=significance),pch=21,color="black",alpha=.3,raster.dpi=600)+
+  geom_point_rast(data=results_aux_promoter_wide_melt_both[TIR1=="Tir1_variant_F79G"  & significance!="Neither"], aes(fill=significance),pch=21,color="black",alpha=.7,raster.dpi=600) +  
+  geom_abline(intercept=0,slope=1,lty=2,col="dark gray")+ 
+ # geom_abline(intercept=0,slope=-1,lty=2,col="dark gray")+
+   ylab("Diffential TIR1[F79G] effect (log2 fold-change)")+
+  xlab("TIR1[F79] effect (log2 fold-change)")+ 
+  scale_fill_manual(values=colors)+
+  scale_color_manual(values=colors)+
+  xlim(axis_lims[1],axis_lims[2])+ylim(axis_lims[1],axis_lims[2])+
+  theme(legend.position="none")
+}
+
+colors = c("black","#FCEA64","#98cF6F")
+names(colors) = c("","Different in eif3Bp.1xAID","Different in eft3p.3xAID")
+
+r_temp = results_aux_promoter_wide_melt_both[TIR1=="Tir1_promoter_eif3Bp.1xAID",]
+lm_res = glm(value.logFC~Tir1_promoter_wo.0xAID.logFC,
+             r_temp,
+             family=stats::gaussian(link="identity"))
+r_temp$residual = residuals(lm_res)
+r_temp[significance%in%c("Both","eft-3"), significance:= ""]
+r_temp[significance%in%c("eif3Bp.1xAID","eft3p.3xAID"), significance:= paste("Different in",significance)]
+
+  
+axis_lims = range(c(results_aux_promoter_wide_melt_both$Tir1_promoter_wo.0xAID.logFC,results_aux_promoter_wide_melt_both$Tir1_promoter_wo.0xAID.logFC+results_aux_promoter_wide_melt_both$value.logFC))
+
+cr =cor(r_temp$Tir1_promoter_wo.0xAID.logFC,r_temp[,Tir1_promoter_wo.0xAID.logFC+value.logFC])
+g_promoter=ggplot(r_temp,aes(Tir1_promoter_wo.0xAID.logFC,Tir1_promoter_wo.0xAID.logFC+value.logFC,color=significance)) + 
+   geom_smooth(method="lm",se=F,aes(color=NULL),color="#537D5D")+
+  geom_hline(yintercept=0,color="grey",lty=2)+
+  geom_vline(xintercept=0,color="grey",lty=2)+
+  geom_point_rast(data=r_temp[significance=="Neither"],aes(fill=significance),pch=21,color="black",alpha=.3,raster.dpi=600) +  
+  geom_point_rast(data=r_temp[significance!="Neither"],aes(fill=significance),pch=21,color="black",alpha=.7,raster.dpi=600) +  
+  geom_abline(intercept=0,slope=1,lty=2,col="dark gray")+ 
+ # geom_abline(intercept=0,slope=-1,lty=2,col="dark gray")+
+  xlab("eft3p::TIR1[F79] effect (log2 fold-change)")+
+  ylab("eif3.Bp::TIR1[F79] effect (log2 fold-change)")+ 
+  scale_fill_manual(values=colors)+
+  scale_color_manual(values=colors)+
+  xlim(axis_lims[1],axis_lims[2])+ylim(axis_lims[1],axis_lims[2])+
+  annotate("text",label=paste0("rho=",round(cr,2)),x=axis_lims[1]*3/4,y=axis_lims[2]*3/4)+
+  theme(legend.position="none")
+
+r_temp = results_aux_promoter_wide_melt_both[TIR1=="Tir1_promoter_eft3p.3xAID" ,]
+lm_res = glm(value.logFC~Tir1_promoter_wo.0xAID.logFC,
+             r_temp,
+             family=stats::gaussian(link="identity"))
+r_temp$residual = residuals(lm_res)
+r_temp[significance%in%c("Both","eft-3"), significance:= ""]
+r_temp[significance%in%c("eif3Bp.1xAID","eft3p.3xAID"), significance:= paste("Different in",significance)]
+
+
+cr =cor(r_temp$Tir1_promoter_wo.0xAID.logFC,r_temp[,Tir1_promoter_wo.0xAID.logFC+value.logFC])
+g_degron=ggplot(r_temp,aes(Tir1_promoter_wo.0xAID.logFC,Tir1_promoter_wo.0xAID.logFC+value.logFC,color=significance)) + 
+  geom_smooth(method="lm",se=F,aes(color=NULL),color="#537D5D")+
+  geom_hline(yintercept=0,color="grey",lty=2)+
+  geom_vline(xintercept=0,color="grey",lty=2)+
+  geom_point_rast(data=r_temp[significance=="Neither"],aes(fill=significance),pch=21,color="black",alpha=.3,raster.dpi=600) +  
+  geom_point_rast(data=r_temp[significance!="Neither"],aes(fill=significance),pch=21,color="black",alpha=1,raster.dpi=600) +  
+  geom_abline(intercept=0,slope=1,lty=2,col="dark gray")+ 
+ # geom_abline(intercept=0,slope=-1,lty=2,col="dark gray")+
+   xlab("daf-2::1xAID effect (log2 fold-change)")+
+  ylab("daf-2::3xAID effect (log2 fold-change)")+ 
+  scale_fill_manual(values=colors)+
+  scale_color_manual(values=colors)+
+  xlim(axis_lims[1],axis_lims[2])+ylim(axis_lims[1],axis_lims[2])+
+  annotate("text",label=paste0("rho=",round(cr,2)),x=axis_lims[1]*3/4,y=axis_lims[2]*3/4)+
+  theme(legend.position="none")
+
+if (0){
+r_temp = results_aux_promoter_wide_melt_both
+
+
+r_temp[,significance := ifelse(Tir1_promoter_wo.0xAID.padj<sig&  abs(Tir1_promoter_wo.0xAID.logFC) >= mag_cutoff , "F79",
+                                                                 ifelse(Tir1_variant_F79A.padj<sig & abs(Tir1_variant_F79A.logFC)>=mag_cutoff &
+                                                                        Tir1_variant_F79G.padj<sig & abs(Tir1_variant_F79G.logFC)>=mag_cutoff,"Different in both F79G and F79A",
+                                                                        ifelse( Tir1_variant_F79G.padj<sig & abs(Tir1_variant_F79G.logFC)>=mag_cutoff,"Different in F79G",
+                                                                        ifelse( Tir1_variant_F79A.padj<sig & abs(Tir1_variant_F79A.logFC)>=mag_cutoff,"Different in F79A",
+                                                                               "Neither"))))]
+
+
+axis_lims = range(c(r_temp$Tir1_variant_F79A.logFC+r_temp$Tir1_variant_none.logFC,
+                    r_temp$Tir1_variant_F79G.logFC+r_temp$Tir1_variant_none.logFC))
+
+colors = c("grey","black","#FCEA64","#98cF6F","lightgreen")
+names(colors) = c("Neither","F79","Different in F79A","Different in F79G","Different in both F79G and F79A")
+
+
+cr =cor(r_temp$Tir1_variant_F79A.logFC+r_temp$Tir1_variant_none.logFC,r_temp$Tir1_variant_F79G.logFC+r_temp$Tir1_variant_none.logFC)
+g_ag=ggplot(r_temp,aes(Tir1_variant_F79A.logFC+Tir1_variant_none.logFC,Tir1_variant_F79G.logFC+Tir1_variant_none.logFC,color=significance)) + 
+  geom_smooth(method="lm",se=F,aes(color=NULL),color="#537D5D")+
+  geom_hline(yintercept=0,color="grey",lty=2)+
+  geom_vline(xintercept=0,color="grey",lty=2)+
+  geom_point_rast(data=r_temp[significance=="Neither"],aes(fill=significance),pch=21,color="black",alpha=.3,raster.dpi=600) +  
+  geom_point_rast(data=r_temp[significance!="Neither"],aes(fill=significance),pch=21,color="black",alpha=1,raster.dpi=600) +  
+  geom_abline(intercept=0,slope=1,lty=2,col="dark gray")+ 
+ # geom_abline(intercept=0,slope=-1,lty=2,col="dark gray")+
+   ylab("TIR1[F79A] effect (log2 fold-change)")+
+  xlab("TIR1[F79G] effect (log2 fold-change)")+ 
+  scale_fill_manual(values=colors)+
+  scale_color_manual(values=colors)+
+  xlim(axis_lims[1],axis_lims[2])+ylim(axis_lims[1],axis_lims[2])+
+  annotate("text",label=paste0("rho=",round(cr,2)),x=axis_lims[1]*3/4,y=axis_lims[2]*3/4)+
+  theme(legend.position="none")
+
+
+}
+
+ggpubr::ggarrange(plotlist=list(g_promoter,g_degron),nrow=1,ncol=2)
+ggsave("TIR1_auxin_dependent_effects_redux_considering_compound_effect_promoter_and_degron.pdf",width=10,height=5)
+
+
+#ggpubr::ggarrange(plotlist=list(g_a_resid,g_g_resid),nrow=1,ncol=2)
+}
+```
+
+
+```{r,fig.width=10,fig.height=5}
+if (0){ #old bad way of doing it
+tmp = results_aux_other_variants_vs_F79_wide
+
+
+results_aux_ontarget_wide_all3_melt = melt(tmp,id.vars=c("GeneName","AuxinType_Aux.logFC"),measure.vars=c("AuxinType_5ad.logFC","AuxinType_5ph.logFC","AuxinType_Aux.logFC"))
+
+results_aux_ontarget_wide_all3_melt[,value := value]  #because the regression is set up relative to F79 and we need to flip the signs so the effects are WT->F79
+
+results_aux_ontarget_wide_all3_melt[,compound:=substring(as.character(variable),11,nchar(as.character(variable))-6)]
+
+results_aux_ontarget_wide_all3_melt_padj=
+melt(tmp,id.vars=c("GeneName","AuxinType_Aux.padj"),measure.vars=c("AuxinType_5ad.padj","AuxinType_5ph.padj","AuxinType_Aux.padj"))
+results_aux_ontarget_wide_all3_melt_padj[,compound:=substring(as.character(variable),11,nchar(as.character(variable))-5)]
+
+results_aux_ontarget_wide_all3_melt_both = merge(results_aux_ontarget_wide_all3_melt,results_aux_ontarget_wide_all3_melt_padj,by=c("GeneName","compound"),suffixes=c(".logFC",".padj"))
+
+results_aux_ontarget_wide_all3_melt_both[,significance := ifelse(AuxinType_Aux.padj<.01 & value.padj<.01 & 
+                                                                   abs(AuxinType_Aux.logFC) >= 1 & abs(value.logFC) >= 1,
+                                                                 "Both",
+                                                                 ifelse(AuxinType_Aux.padj<.01 & abs(AuxinType_Aux.logFC)>=1,"Aux",
+                                                                        ifelse(value.padj<.01 & abs(value.logFC)>=1,compound,
+                                                                               "Neither")))]
+colors = c("black","#64C5EB","#E84D8A")
+names(colors) = c("","Different in 5ad","Different in 5ph")
+
+sig_genes =  tmp[AuxinType_5ad.logFC < .01 | AuxinType_5ph.padj < .01 | AuxinType_Aux.padj<.01,GeneName]
+results_aux_ontarget_wide_all3_melt_both_sig = results_aux_ontarget_wide_all3_melt_both[compound!="Aux"];#[GeneName %in% sig_genes,]
+axis_lims = range(c(results_aux_ontarget_wide_all3_melt_both_sig$AuxinType_Aux.logFC,results_aux_ontarget_wide_all3_melt_both_sig$value.logFC))
+#unique(res_l_a[,.(significance,colors[significance])])
+
+r_temp = results_aux_ontarget_wide_all3_melt_both_sig[compound=="5ad",]
+lm_res = glm(value.logFC~AuxinType_Aux.logFC,
+             r_temp,
+             family=stats::gaussian(link="identity"))
+r_temp$residual = residuals(lm_res)
+r_temp[significance%in%c("Both","Aux"), significance:= ""]
+r_temp[significance%in%c("5ad","5ph"), significance:= paste("Different in",significance)]
+
+axis_lims = range(c(results_aux_ontarget_wide_all3_melt_both_sig$AuxinType_Aux.logFC,results_aux_ontarget_wide_all3_melt_both_sig$variable.logFC))
+
+cr =cor(r_temp$AuxinType_Aux.logFC,r_temp[,value.logFC])
+g_a=ggplot(r_temp,aes(AuxinType_Aux.logFC,value.logFC,color=significance)) + 
+   geom_smooth(method="lm",se=F,aes(color=NULL),color="#537D5D")+
+  geom_hline(yintercept=0,color="grey",lty=2)+
+  geom_vline(xintercept=0,color="grey",lty=2)+
+  geom_point_rast(data=r_temp[significance=="Neither"],aes(fill=significance),pch=21,color="black",alpha=.3,raster.dpi=600) +  
+  geom_point_rast(data=r_temp[significance!="Neither"],aes(fill=significance),pch=21,color="black",alpha=.7,raster.dpi=600) +  
+  geom_abline(intercept=0,slope=1,lty=2,col="dark gray")+ 
+ # geom_abline(intercept=0,slope=-1,lty=2,col="dark gray")+
+  xlab("K-NAA effect (log2 fold-change)")+
+  ylab("5-Ad-IAA effect (log2 fold-change)")+ 
+  scale_fill_manual(values=colors)+
+  scale_color_manual(values=colors)+
+  xlim(axis_lims[1],axis_lims[2])+ylim(axis_lims[1],axis_lims[2])+
+  annotate("text",label=paste0("rho=",round(cr,2)),x=axis_lims[1]*3/4,y=axis_lims[2]*3/4)+
+  theme(legend.position="none")
+
+r_temp = results_aux_ontarget_wide_all3_melt_both_sig[compound=="5ph",]
+lm_res = glm(value.logFC~AuxinType_Aux.logFC,
+             r_temp,
+             family=stats::gaussian(link="identity"))
+r_temp$residual = residuals(lm_res)
+r_temp[significance%in%c("Both","Aux"), significance:= ""]
+r_temp[significance%in%c("5ad","5ph"), significance:= paste("Different in",significance)]
+
+axis_lims = range(c(results_aux_ontarget_wide_all3_melt_both_sig$AuxinType_Aux.logFC,results_aux_ontarget_wide_all3_melt_both_sig$variable.logFC))
+
+cr =cor(r_temp$AuxinType_Aux.logFC,r_temp[,value.logFC])
+g_g=ggplot(r_temp,aes(AuxinType_Aux.logFC,value.logFC,color=significance)) + 
+   geom_smooth(method="lm",se=F,aes(color=NULL),color="#537D5D")+
+  geom_hline(yintercept=0,color="grey",lty=2)+
+  geom_vline(xintercept=0,color="grey",lty=2)+
+  geom_point_rast(data=r_temp[significance=="Neither"],aes(fill=significance),pch=21,color="black",alpha=.3,raster.dpi=600) +  
+  geom_point_rast(data=r_temp[significance!="Neither"],aes(fill=significance),pch=21,color="black",alpha=.7,raster.dpi=600) +  
+  geom_abline(intercept=0,slope=1,lty=2,col="dark gray")+ 
+ # geom_abline(intercept=0,slope=-1,lty=2,col="dark gray")+
+  xlab("K-NAA effect (log2 fold-change)")+
+  ylab("5-Ph-IAA effect (log2 fold-change)")+ 
+  scale_fill_manual(values=colors)+
+  scale_color_manual(values=colors)+
+  xlim(axis_lims[1],axis_lims[2])+ylim(axis_lims[1],axis_lims[2])+
+  annotate("text",label=paste0("rho=",round(cr,2)),x=axis_lims[1]*3/4,y=axis_lims[2]*3/4)+
+  theme(legend.position="none")
+
+
+ggpubr::ggarrange(plotlist=list(g_a,g_g),nrow=1,ncol=2)
+ggsave("TIR1_auxin_dependent_effects_redux_considering_compound_effect=compund_terms.pdf",width=10,height=5)
+}
+```
+
+
+
+```{r}
+ #write out data tables for TIR1 variant and compound effects
+
+sig = .0001
+mag_cutoff =  log2(1.5)
+
+mapping_1x = data.table(group=c(
+                      "Tir1_variant_F79A",
+                      "Tir1_variant_F79G",
+                      "Tir1_variant_WT",
+                      "AuxinType_5ad",
+                      "AuxinType_5ph",
+                      "AuxinType_Aux"),
+                      Genotype =
+                            c("eft3p::TIR1[F79A]::mRuby; daf2::AID::3xFLAG(codon optimized)",
+                            "eft3p::TIR1[F79G]::mRuby; daf2::AID::3xFLAG(codon optimized)",
+                            "eft3p::TIR1::mRuby; daf2::AID::3xFLAG(codon optimized)",
+                            "eft3p::TIR1[F79A]::mRuby; daf2::AID::3xFLAG(codon optimized)",
+                            "eft3p::TIR1[F79G]::mRuby; daf2::AID::3xFLAG(codon optimized)",
+                            "eft3p::TIR1::mRuby; daf2::AID::3xFLAG(codon optimized)"),
+                     label=c("eft3p::TIR1(F79A) ; daf-2::1xAID",
+                                  "eft3p::TIR1(F79G) ; daf-2::1xAID",
+                                  "eft3p::TIR1(F79) ; daf-2::1xAID",
+                                  "5-Ad-IAA",
+                                  "5-Ph-IAA",
+                                  "KNAA")
+)
+mapping_3x = data.table(group=c(
+                      "Tir1_variant_F79A",
+                      "Tir1_variant_F79G",
+                      "Tir1_variant_WT",
+                      "AuxinType_5ad",
+                      "AuxinType_5ph",
+                      "AuxinType_Aux"),
+                      Genotype =
+                            c("eft3p::TIR1[F79A]::mRuby; daf2::3xAID::3xFLAG(codon optimized)",
+                            "eft3p::TIR1[F79G]::mRuby; daf2::3xAID::3xFLAG(codon optimized)",
+                            "eft3p::TIR1::mRuby; daf2::3xAID::3xFLAG(codon optimized)",
+                            "eft3p::TIR1[F79A]::mRuby; daf2::3xAID::3xFLAG(codon optimized)",
+                            "eft3p::TIR1[F79G]::mRuby; daf2::3xAID::3xFLAG(codon optimized)",
+                            "eft3p::TIR1::mRuby; daf2::3xAID::3xFLAG(codon optimized)"),
+                     label=c("eft3p::TIR1(F79A) ; daf-2::3xAID",
+                                  "eft3p::TIR1(F79G) ; daf-2::3xAID",
+                                  "eft3p::TIR1(F79) ; daf-2::3xAID",
+                                  "5-Ad-IAA",
+                                  "5-Ph-IAA",
+                                  "KNAA")
+)
+setkey(mapping_1x,label)
+setkey(mapping_3x,label)
+
+
+
+#compile the absolute TIR1 effects by adding together the regression parameters
+tbl = results_aux_other_variants_vs_F79_3xAID_wide_abs
+
+tmp3x = rbind(
+           data.table(
+           label=rep("eft3p::TIR1(F79A) ; daf-2::3xAID",nrow(tbl)),
+           GeneName = tbl$GeneName,
+           log2FoldChange= tbl[,Tir1_variantF79A.logFC+AuxinType5ad.Tir1_variantF79A.logFC],
+        #   pvalue=tbl[,pmin(Tir1_variantF79A.pvalue,AuxinType5ad.Tir1_variantF79A.pvalue)],
+           padj=tbl[,pmin(Tir1_variantF79A.padj,AuxinType5ad.Tir1_variantF79A.padj)]),
+           data.table(
+           label=rep("eft3p::TIR1(F79G) ; daf-2::3xAID",nrow(tbl)),
+           GeneName = tbl$GeneName,
+           log2FoldChange= tbl[,Tir1_variantF79G.logFC+AuxinType5ph.Tir1_variantF79G.logFC],
+      #     pvalue=tbl[,pmin(Tir1_variantF79G.pvalue,AuxinType5ph.Tir1_variantF79G.pvalue)],
+           padj=tbl[,pmin(Tir1_variantF79G.padj,AuxinType5ph.Tir1_variantF79G.padj)]),
+           data.table(
+           label=rep("eft3p::TIR1(F79) ; daf-2::3xAID",nrow(tbl)),
+           GeneName = tbl$GeneName,
+           log2FoldChange= tbl[,Tir1_variantWT.logFC+AuxinTypeAux.Tir1_variantWT.logFC],
+        #   pvalue=tbl[,pmin(Tir1_variantF79WT.pvalue,AuxinType5Aux.Tir1_variantF79WT.pvalue)],
+           padj=tbl[,pmin(Tir1_variantWT.padj,AuxinTypeAux.Tir1_variantWT.padj)]),
+           data.table(
+           label=rep("5-Ad-IAA",nrow(tbl)),
+           GeneName = tbl$GeneName,
+           log2FoldChange= tbl[,AuxinType5ad.logFC],
+         #  pvalue=tbl[,AuxinType5ad.pvalue],
+           padj=tbl[,AuxinType5ad.padj]),
+           data.table(
+           label=rep("5-Ph-IAA",nrow(tbl)),
+           GeneName = tbl$GeneName,
+           log2FoldChange= tbl[,AuxinType5ph.logFC],
+         #  pvalue=tbl[,AuxinType5ph.pvalue],
+           padj=tbl[,AuxinType5ph.padj]),
+           data.table(
+           label=rep("KNAA",nrow(tbl)),
+           GeneName = tbl$GeneName,
+           log2FoldChange= tbl[,AuxinTypeAux.logFC],
+      #    pvalue=tbl[,AuxinTypeAux.pvalue],
+           padj=tbl[,AuxinTypeAux.padj])
+)
+tmp3x$group = mapping_3x[tmp3x$label,group]
+tmp3x$Genotype = mapping_3x[tmp3x$label,Genotype]
+tmp3x$AID= "3X"
+
+results_aux_ontarget_long_precursor = tmp3x;
+
+#compile the absolute TIR1 effects by adding together the regression parameters
+tbl = results_aux_other_variants_vs_F79_wide_abs
+
+tmp1x = rbind(
+           data.table(
+           label=rep("eft3p::TIR1(F79A) ; daf-2::1xAID",nrow(tbl)),
+           GeneName = tbl$GeneName,
+           log2FoldChange= tbl[,Tir1_variantF79A.logFC+AuxinType5ad.Tir1_variantF79A.logFC],
+        #   pvalue=tbl[,pmin(Tir1_variantF79A.pvalue,AuxinType5ad.Tir1_variantF79A.pvalue)],
+           padj=tbl[,pmin(Tir1_variantF79A.padj,AuxinType5ad.Tir1_variantF79A.padj)]),
+           data.table(
+           label=rep("eft3p::TIR1(F79G) ; daf-2::1xAID",nrow(tbl)),
+           GeneName = tbl$GeneName,
+           log2FoldChange= tbl[,Tir1_variantF79G.logFC+AuxinType5ph.Tir1_variantF79G.logFC],
+      #     pvalue=tbl[,pmin(Tir1_variantF79G.pvalue,AuxinType5ph.Tir1_variantF79G.pvalue)],
+           padj=tbl[,pmin(Tir1_variantF79G.padj,AuxinType5ph.Tir1_variantF79G.padj)]),
+           data.table(
+           label=rep("eft3p::TIR1(F79) ; daf-2::1xAID",nrow(tbl)),
+           GeneName = tbl$GeneName,
+           log2FoldChange= tbl[,Tir1_variantWT.logFC+AuxinTypeAux.Tir1_variantWT.logFC],
+        #   pvalue=tbl[,pmin(Tir1_variantF79WT.pvalue,AuxinType5Aux.Tir1_variantF79WT.pvalue)],
+           padj=tbl[,pmin(Tir1_variantWT.padj,AuxinTypeAux.Tir1_variantWT.padj)]),
+           data.table(
+           label=rep("5-Ad-IAA",nrow(tbl)),
+           GeneName = tbl$GeneName,
+           log2FoldChange= tbl[,AuxinType5ad.logFC],
+         #  pvalue=tbl[,AuxinType5ad.pvalue],
+           padj=tbl[,AuxinType5ad.padj]),
+           data.table(
+           label=rep("5-Ph-IAA",nrow(tbl)),
+           GeneName = tbl$GeneName,
+           log2FoldChange= tbl[,AuxinType5ph.logFC],
+         #  pvalue=tbl[,AuxinType5ph.pvalue],
+           padj=tbl[,AuxinType5ph.padj]),
+           data.table(
+           label=rep("KNAA",nrow(tbl)),
+           GeneName = tbl$GeneName,
+           log2FoldChange= tbl[,AuxinTypeAux.logFC],
+      #    pvalue=tbl[,AuxinTypeAux.pvalue],
+           padj=tbl[,AuxinTypeAux.padj])
+)
+tmp1x$AID= "1X"
+tmp1x$group = mapping_1x[tmp1x$label,group]
+tmp1x$Genotype = mapping_1x[tmp1x$label,Genotype]
+
+tmp = rbind(tmp1x,tmp3x)
+tmp[,quantification_type:=ifelse(grepl("TIR1",label),"relative_to_WT","TIR1-independent")]
+tmp$pvalue = NA;
+
+all_ontarget_results = tmp[,.(GeneName,group,log2FoldChange,pvalue,padj,Genotype,label,quantification_type),]
+
+ unique(all_ontarget_results[,.(quantification_type,label)])
+ 
+all_ontarget_results$Auxin=T
+setkey(geneid,GeneName)
+all_ontarget_results$GeneSymbol = geneid[all_ontarget_results$GeneName,GeneSymbol]
+all_ontarget_results[is.na(padj),padj:=1]
+all_ontarget_results[,sig:=padj<sig & abs(log2FoldChange)>mag_cutoff]
+
+all_ontarget_results[,covariate:=NULL]
+all_ontarget_results[,baseMean :=NULL]
+all_ontarget_results[,stat     :=NULL]
+
+fwrite(all_ontarget_results,"Supplementary table - activated TIR1;daf-2 effects.csv.gz",row.names=F)
+
+```
+
+```{r,fig.width=15,fig.height=5}
+
+sig = .0001
+mag_cutoff =  log2(1.5)
+
+tbl = results_aux_other_variants_vs_F79_wide_abs
+
+results_aux_ontarget_long = 
+           data.table(
+           label=rep("eft3p::TIR1(F79A) ; daf-2::1xAID",nrow(tbl)),
+           GeneName = tbl$GeneName,
+           log2FoldChange= tbl[,Tir1_variantF79A.logFC+AuxinType5ad.Tir1_variantF79A.logFC+AuxinType5ph.logFC],
+        #   pvalue=tbl[,pmin(Tir1_variantF79A.pvalue,AuxinType5ad.Tir1_variantF79A.pvalue)],
+           padj=tbl[,pmin(Tir1_variantF79A.padj,AuxinType5ad.Tir1_variantF79A.padj,AuxinType5ph.padj)])
+        
+results_aux_ontarget_long[,group:="activated"]
+
+auxin_effect = results_aux_ontarget_long_precursor[group=="AuxinType_Aux",]
+auxin_effect[,group:="KNAA"]
+
+all_res = rbind(results_aux_ind_long,results_aux_ind_long_double,results_aux_ontarget_long,auxin_effect,fill=T)[group!="Intercept"&padj<sig&abs(log2FoldChange)>mag_cutoff,]
+tab = aggregate(log2FoldChange~group,all_res,length)
+name_mapping_level_order =      c("TIR1(WT);+",
+                                  "TIR1(F79A);+",
+                                  "TIR1(F79G);+",
+                                  "eif-3p::TIR1(WT);+",
+                                  "+;DAF-2::1xAID",
+                                  "+;DAF2::3xAID",
+                                  "TIR1(WT);DAF-2::1xAID",
+                                  "KNAA",
+                                  "TIR1(WT);DAF-2::1xAID+KNAA")
+
+name_mapping = data.table(group=c("eft3p_F79F_0XAID",
+                                   "eft3p_F79A_0xAID",
+                                   "eft3p_F79G_0xAID",
+                                   "eif3p_F79F_0XAID",
+                                   "N_N_1xAID",
+                                   "N_N_3xAID",
+                                   "eft3p_F79F_1XAID",
+                                    "KNAA",
+                                   "activated"),
+                          type = c("TIR1",
+                                   "TIR1",
+                                   "TIR1",
+                                   "TIR1",
+                                   "Degron",
+                                   "Degron",
+                                   "Double",
+                                   "Double+KNAA",
+                                   "Double+KNAA"),
+                          label=name_mapping_level_order)
+setkey(name_mapping,group)
+all_res$label = factor(name_mapping[all_res$group,label],levels=name_mapping_level_order,ordered=T)
+all_res$type = factor(name_mapping[all_res$group,type])
+
+num_Genes = length(unique(results_aux_ontarget_long$GeneName))
+label_tab = as.data.frame(table(all_res[,.(label)]))
+label_tab$label = factor(as.character(label_tab$label),levels=name_mapping_level_order,ordered=T)
+label_tab$label2 = paste0(round(label_tab$Freq/num_Genes*100,2),"%")
+label_tab$x = label_tab$label
+
+ggplot(all_res,aes(x=label,fill=type))+
+  geom_bar()+
+  theme(legend.position="none", axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) + 
+  geom_text(data=label_tab,aes(x=x,y=Freq/2,label=label2,color="black",fill="black"),color="black",fill="black")+
+  annotate("text",x=2,y=max(label_tab$Freq),label=paste(num_Genes,"genes considered"))+ylab("Number of genes\n differentiall expressed\ncompared to wild-type")+xlab("")
+ggsave("sig_gene_barchart.pdf",width=6,height=5)
+
+
+
+names_to_output=c("TIR1(WT);+",
+                                  "TIR1(F79A);+",
+                                  "TIR1(F79G);+",
+                                  "eif-3p::TIR1(WT);+",
+                                  "+;DAF-2::1xAID",
+                                  "+;DAF2::3xAID")
+all_res$GeneSymbol = geneid[all_res$GeneName,GeneSymbol]
+all_res2 = all_res[label%in% names_to_output & padj<.001,.(label,type,GeneSymbol)]
+all_res2 = all_res2[order(label,GeneSymbol),]
+fwrite(all_res2,"data_for_degron_component_effects.csv.gz",row.names=F)
+
+
+rr = aggregate(label~GeneSymbol+type,all_res2,FUN=length)
+rr= rr[order(rr$label),]
+```
+
+
+```{r}
+#look at effect of each component of the AID system without any other components relative to wild-type
+annots_aux_ind = annotations_aie[Biological_replicate==2,]
+
+genes_to_exclude = c("TIR1-DERNBERG")
+counts_aux_ind = counts[ rownames(counts)%!in%genes_to_exclude,annots_aux_ind$Sample]
+nf_aux_ind <- calculateSumFactors(counts_aux_ind)
+
+ind_Genotype_mapping = data.table(Genotype=c("eft3p::TIR1[F79G]",
+                                    "eft3p::TIR1[F79A]",
+                                    "daf2::AID::3xFLAG(codon optimized)",
+                                    "daf2::3xAID::3xFLAG(codon optimized)",
+                                    "eft3p::TIR1",
+                                    "eif3p::TIR1",
+                                    "N2"),
+                                  label=c("eft3p_F79G_0xAID",
+                                          "eft3p_F79A_0xAID",
+                                          "N_N_1xAID",
+                                          "N_N_3xAID",
+                                          "eif3p_F79F_0XAID",
+                                          "eft3p_F79F_0XAID",
+                                          "N_N_0xAID"))
+setkey(ind_Genotype_mapping,Genotype)
+annots_aux_ind$label = factor(ind_Genotype_mapping[annots_aux_ind$Genotype,label])
+annots_aux_ind$label = relevel(annots_aux_ind$label,"N_N_0xAID")
+dds_aux_ind<- DESeqDataSetFromMatrix(countData = counts_aux_ind,
+                                     colData = annots_aux_ind,
+                                     design = ~ label)
+sizeFactors(dds_aux_ind) <- nf_aux_ind # use scran normalization
+dds_aux_ind <- estimateDispersions(dds_aux_ind) # estimate overdispersion parameter
+dds_aux_ind <- nbinomWaldTest(dds_aux_ind) # run NB GLM and do Wald Test on coefficients
+
+results_aux_ind <- lapply(resultsNames(dds_aux_ind), function(i) {
+  r <- results(dds_aux_ind, name = i)
+  r <- as.data.table(r)
+  colnames(r) <- paste0(i, "_", colnames(r))
+  r
+})
+results_aux_ind2 = cbind(results_aux_ind[[1]],results_aux_ind[[2]],results_aux_ind[[3]],results_aux_ind[[4]],results_aux_ind[[5]],results_aux_ind[[6]],results_aux_ind[[7]])
+results_aux_ind2[, GeneName := rownames(counts_aux_ind)]
+
+results_aux_ind_long <- rbindlist(lapply(resultsNames(dds_aux_ind), function(i) {
+  r <- results(dds_aux_ind, name = i)
+  r <- as.data.table(r)
+  r[, GeneName := rownames(counts_aux_ind)]
+  r$covariate = i
+  r
+}))
+
+results_aux_ind_long[,group:=substring(covariate,7,nchar(covariate)-13)]
+results_aux_ind_long[,group:=ifelse(group=="","Intercept",group)]
+results_aux_ind_long = results_aux_ind_long[group!="Intercept",]
+```
+
+
+```{r}
+tmp = results_aux_ind_long
+tmp[,label :=group]
+setkey(geneid,GeneName)
+tmp$GeneSymbol = geneid[tmp$GeneName,GeneSymbol]
+tmp$sig = tmp[,padj<.001 & abs(log2FoldChange)>1]
+tmp = tmp[!is.na(sig),]
+tmp[,covariate:=NULL]
+tmp[,baseMean :=NULL]
+tmp[,stat     :=NULL]
+tmp[,group     :=NULL]
+fwrite(tmp,"Supplementary table  - degron component effects.csv,gz",row.names=F)
+```
+
+
+
+```{r}
+#look at effect of TIR1 variants without any other aid system components using a cross-term model
+
+annots_aux_ind_x_double1 = annots_aux_ind[Genotype=="N2",]
+counts_aux_ind_x_double1 = counts_aux_ind[,annots_aux_ind_x_double1$Sample]
+annots_aux_ind_x_double2 = annots_aux_ind[Genotype=="N2",]
+counts_aux_ind_x_double2 = counts_aux_ind[,annots_aux_ind_x_double2$Sample]
+annots_aux_ind_x_double3 = annots_aux_ind[Genotype=="N2",]
+counts_aux_ind_x_double3 = counts_aux_ind[,annots_aux_ind_x_double3$Sample]
+colnames(counts_aux_ind_x_double1)=paste0(colnames(counts_aux_ind_x_double1),"x1")
+colnames(counts_aux_ind_x_double2)=paste0(colnames(counts_aux_ind_x_double2),"x2")
+colnames(counts_aux_ind_x_double3)=paste0(colnames(counts_aux_ind_x_double2),"x3")
+
+annots_aux_ind_x_double1$Genotype="N2_1";
+annots_aux_ind_x_double2$Genotype="N2_2";
+annots_aux_ind_x_double3$Genotype="N2_3";
+annots_aux_ind_x_double1$Sample = colnames(counts_aux_ind_x_double1)
+annots_aux_ind_x_double2$Sample = colnames(counts_aux_ind_x_double2)
+annots_aux_ind_x_double3$Sample = colnames(counts_aux_ind_x_double3)
+
+ind_Genotype_mapping_x = data.table(Genotype=c("eft3p::TIR1[F79G]",
+                                    "eft3p::TIR1[F79A]",
+                                    "eft3p::TIR1",
+                                    "eif3p::TIR1",
+                                    "N2",
+                                    "N2_1",
+                                    "N2_2",
+                                    "N2_3"),
+                                  label=c("eft3p_F79G_0xAID",
+                                          "eft3p_F79A_0xAID",
+                                          "eif3p_F79F_0XAID",
+                                          "eft3p_F79F_0XAID",
+                                          "N_N_0xAID",
+                                          "N_N_0xAID_1",
+                                          "N_N_0xAID_2",
+                                          "N_N_0xAID_3"),
+                                  TIR1 = c(T,T,T,T,F,F,F,F),
+                                  Variant= c("G","A","E","F","G","A","E","F"))
+
+
+annots_aux_ind_x = rbind(annots_aux_ind,
+                         annots_aux_ind_x_double1,
+                         annots_aux_ind_x_double2,
+                         annots_aux_ind_x_double3)[Biological_replicate==2 & Genotype %in% ind_Genotype_mapping_x$Genotype,]
+
+genes_to_exclude = c("TIR1-DERNBERG")
+counts_aux_ind_x = cbind(counts_aux_ind,
+                         counts_aux_ind_x_double1,
+                         counts_aux_ind_x_double2,
+                         counts_aux_ind_x_double3)[ rownames(counts_aux_ind)%!in%genes_to_exclude,annots_aux_ind_x$Sample]
+nf_aux_ind_x <- calculateSumFactors(counts_aux_ind_x)
+
+
+setkey(ind_Genotype_mapping_x,Genotype)
+annots_aux_ind_x$label = factor(ind_Genotype_mapping_x[annots_aux_ind_x$Genotype,label])
+annots_aux_ind_x$label = relevel(annots_aux_ind_x$label,"N_N_0xAID")
+annots_aux_ind_x$TIR1 = factor(ind_Genotype_mapping_x[annots_aux_ind_x$Genotype,TIR1])
+annots_aux_ind_x$TIR1 = relevel(annots_aux_ind_x$TIR1,"FALSE")
+annots_aux_ind_x$Variant = factor(ind_Genotype_mapping_x[annots_aux_ind_x$Genotype,Variant])
+annots_aux_ind_x$Variant = relevel(annots_aux_ind_x$Variant,"F")
+
+dds_aux_ind_x<- DESeqDataSetFromMatrix(countData = counts_aux_ind_x,
+                                     colData = annots_aux_ind_x,
+                                     design = ~ TIR1*Variant)
+sizeFactors(dds_aux_ind_x) <- nf_aux_ind_x # use scran normalization
+dds_aux_ind_x <- estimateDispersions(dds_aux_ind_x) # estimate overdispersion parameter
+dds_aux_ind_x <- nbinomWaldTest(dds_aux_ind_x) # run NB GLM and do Wald Test on coefficients
+
+results_aux_ind_x <- lapply(resultsNames(dds_aux_ind_x), function(i) {
+  r <- results(dds_aux_ind_x, name = i)
+  r <- as.data.table(r)
+  colnames(r) <- paste0(i, "_", colnames(r))
+  r
+})
+results_aux_ind2_x = cbind(results_aux_ind_x[[1]],results_aux_ind_x[[2]],results_aux_ind_x[[3]],results_aux_ind_x[[4]],results_aux_ind_x[[5]],results_aux_ind_x[[6]],results_aux_ind_x[[7]],results_aux_ind_x[[8]])
+results_aux_ind2_x[, GeneName := rownames(counts_aux_ind_x)]
+
+results_aux_ind_x_long <- rbindlist(lapply(resultsNames(dds_aux_ind_x), function(i) {
+  r <- results(dds_aux_ind_x, name = i)
+  r <- as.data.table(r)
+  r[, GeneName := rownames(counts_aux_ind_x)]
+  r$covariate = i
+  r
+}))
+
+```
+
+```{r,fig.width=15,fig.height=5}
+sig = .01
+mag_cutoff = .5
+#look at the different TIR1 variants without any degrons
+covars = unique(name_mapping$group);
+ref = "eft3p_F79F_0XAID"
+covars_sub = covars[grepl("0[x,X]AID",covars) & covars!=ref]
+
+any_sig_res = results_aux_ind_long[group%in% c(covars,ref)& GeneName %in% sig_genes,]
+transform_neg_log10 = function(x)-log10(x)
+#ggplot(any_sig_res,aes(2^log2FoldChange,padj,fill=group,color=group))+geom_point() + scale_y_continuous(trans="log10")
+
+covar_x_lookup = data.table(label=c("eft3p_F79A_0xAID","eft3p_F79G_0xAID","eif3p_F79F_0XAID","eft3p_F79F_0XAID"),
+                            axis_label=c("F79A","F79G","eif3.Bp::TIR1(WT)","F79F"),
+                            xterm_colname=c("TIR1TRUE.VariantA","TIR1TRUE.VariantG","TIR1TRUE.VariantE",NA))
+
+rng = range(any_sig_res$log2FoldChange)
+setkey(geneid,GeneName)
+lst = lapply(covars_sub,function(covar){
+  dat = dcast(any_sig_res[group%in%c(ref,covar),],GeneName~group,value.var="log2FoldChange")
+  dat$GeneSymbol = geneid[dat$GeneName,GeneSymbol]
+  cr = cor(x=dat[,get(ref)],y=dat[,get(covar)])
+  
+  cross_pvals = results_aux_ind_x_long[covariate==covar_x_lookup[label==covar,xterm_colname]&padj<sig & abs(log2FoldChange) >= mag_cutoff,]
+  
+  main_pvals = any_sig_res[group%in%c(ref,covar)&padj<sig & abs(log2FoldChange) >= mag_cutoff,]
+  
+  dat$sig_x = ifelse(dat$GeneName %in% main_pvals$GeneName,"TIR1","N")
+  dat$sig_x = ifelse(dat$GeneName %in% cross_pvals$GeneName,"X",dat$sig_x)
+  
+  ggplot(dat,aes_string(ref,covar)) + geom_hline(yintercept=0,lty=2,col="dark gray")+geom_vline(xintercept=0,lty=2,col="dark gray")+geom_abline(slope=1,intercept=0,lty=2,col="dark gray")+
+    geom_point(data=dat[sig_x=="N"],aes(color=sig_x))+
+    geom_point(data=dat[sig_x!="N"],aes(color=sig_x))+
+    xlim(rng)+ylim(rng) +
+    geom_smooth(se=F,method="lm") + 
+    geom_text_repel(data=dat[sig_x=="X",],aes(label=GeneSymbol),col="red")+
+    scale_color_manual(values=c("N"="grey","TIR1"="black","X"="red"))+
+    xlab("Effect of peft3::TIR1(WT)\n(log2 fold-change)")+
+    ylab(paste0("Effect of ",covar_x_lookup[label==covar,axis_label],"\n(log2 fold-change)"))+
+    annotate("text",label=paste0("rho=",round(cr,2)),x=rng[1]*3/4,y=rng[2]*3/4)
+})
+
+ggpubr::ggarrange(plotlist=lst,ncol=3)
+ggsave("effect_of_TIR1_variants_absent_degron.pdf",width=15,height=5)
+
+setkey(covar_x_lookup,"label")
+#generate table
+lst = lapply(covar_x_lookup$label,function(covar){
+  dat = any_sig_res[group==covar,.(GeneName,log2FoldChange,padj)]
+  if (!is.na(covar_x_lookup[label==covar,xterm_colname])){
+    dat[,cross_sig := GeneName %in% results_aux_ind_x_long[covariate==covar_x_lookup[label==covar,xterm_colname]&padj<sig & abs(log2FoldChange) >= mag_cutoff,GeneName]]
+    names(dat)[2:4] = paste0(covar_x_lookup[covar,axis_label],c(".log2FC",".padj",".x_sig"))
+  }else names(dat)[2:3] = paste0(covar_x_lookup[covar,axis_label],c(".log2FC",".padj"))
+  dat
+})
+data_table_final=merge(lst[[2]],merge(lst[[1]],merge(lst[[3]],lst[[4]],by="GeneName"),by="GeneName"),by="GeneName")
+data_table_final = data_table_final[order(F79A.x_sig|F79G.x_sig|`eif3.Bp::TIR1(WT).x_sig`,decreasing=T),]
+data_table_final$GeneSymbol = geneid[data_table_final$GeneName,GeneSymbol]
+write.csv(data_table_final,"TIR1_auxin-independent_effects.csv",row.names=F)
+
+
+r1 = "eft3p_F79A_0xAID"
+r2 = "eft3p_F79G_0xAID"
+dat = dcast(any_sig_res[group%in%c(r1,r2),],GeneName~group,value.var="log2FoldChange")
+dat$GeneSymbol = geneid[dat$GeneName,GeneSymbol]
+cr = cor(x=dat[,get(r1)],y=dat[,get(r2)])
+  ggplot(dat,aes_string(r1,r2)) + geom_hline(yintercept=0,lty=2,col="dark gray")+geom_vline(xintercept=0,lty=2,col="dark gray")+geom_abline(slope=1,intercept=0,lty=2,col="dark gray")+
+    geom_point() +xlim(rng)+ylim(rng) +
+    geom_smooth(se=F,method="lm") + 
+    geom_text_repel(aes(label=GeneSymbol))+
+    annotate("text",label=paste0("rho=",round(cr,2)),x=rng[1]*3/4,y=rng[2]*3/4) + xlab("Effect of TIR1(F79A)\n(log2 fold-change)") + ylab("Effect of TIR1(F79G)\n(log2 fold-change)")
+
+ggsave("similarities_of_TIR1_F79G_and_A_absent_degron.pdf",width=5,height=5)
+
+
+dat2 = dcast(any_sig_res[group%in%c(r1,r2),],GeneName~group,value.var="padj")
+dat3=merge(dat,dat2,by="GeneName")
+dat$GeneSymbol = geneid[dat$GeneName,GeneSymbol]
+
+
+library(ggVennDiagram)
+  
+  groups = c(r1,r2)
+res=lapply(groups,function(g){
+  any_sig_res[group==g&padj<sig&abs(log2FoldChange)>=mag_cutoff,GeneName]
+})
+names(res)=groups
+ggVennDiagram(res, 
+              label_alpha=0, 
+              set_color = c("blue","red"),
+              label="count")+
+            ggplot2::scale_fill_gradient(low = "white", high = "white")+theme(legend.position="none")+scale_x_continuous(expand = expansion(mult = 1.1))
+
+ggsave("similarities_of_TIR1_F79G_and_A_absent_degron_Venn_Diagram.pdf",width=5,height=5)
+groups = c(ref,covars_sub)
+res=lapply(groups,function(g){
+  any_sig_res[group==g&padj<sig&abs(log2FoldChange)>=mag_cutoff,GeneName]
+})
+
+name_lookup_vd = c(eft3p_F79F_0XAID="F79", eft3p_F79A_0xAID="F79F", eft3p_F79G_0xAID="F79G", eif3p_F79F_0XAID="eif-3B.p::F79")
+names(res)=name_lookup_vd[groups]
+
+library(ggVennDiagram)
+ggVennDiagram(res, 
+              label_alpha=0, 
+              set_color = c("blue","red","green","purple"),
+              label="count")+
+            ggplot2::scale_fill_gradient(low = "white", high = "white")+theme(legend.position="none")+scale_x_continuous(expand = expansion(mult = .2))
+ggsave("similarities_of_all_TIR1s_absent_degron_Venn_Diagram.pdf",width=5,height=5)
+
+
+```
+
+
+
+```{r,fig.width=5,fig.height=5}
+#look at effect of degron
+res = aggregate(padj~group,results_aux_ind_long,function(x) length(which(x<.001))/length(x))
+sig_genes = unique(results_aux_ind_long[group!="Intercept"& padj<.001,GeneName])
+
+
+covars = unique(results_aux_ind_long$group);
+ref = "N_N_1xAID"
+covars_sub = covars[!grepl("0[x,X]AID",covars) & !grepl("Intercept",covars) & covars!=ref]
+
+any_sig_res = results_aux_ind_long[group%in% c(covars,ref)& GeneName %in% sig_genes,]
+transform_neg_log10 = function(x)-log10(x)
+ggplot(any_sig_res,aes(2^log2FoldChange,padj,color=group))+geom_point() + scale_y_continuous(trans="log10")
+
+
+r1 = ref
+r2 = covars_sub
+dat = dcast(any_sig_res[group%in%c(r1,r2),],GeneName~group,value.var="log2FoldChange")
+sig_in_either = 
+dat$GeneSymbol = geneid[dat$GeneName,GeneSymbol]
+cr = cor(x=dat[,get(r1)],y=dat[,get(r2)])
+  ggplot(dat,aes_string(r1,r2)) + geom_hline(yintercept=0,lty=2,col="dark gray")+geom_vline(xintercept=0,lty=2,col="dark gray")+geom_abline(slope=1,intercept=0,lty=2,col="dark gray")+
+    geom_point() +
+    xlim(rng)+ylim(rng) +
+    geom_smooth(se=F,method="lm") + 
+    geom_text_repel(aes(label=GeneSymbol))+
+    annotate("text",label=paste0("rho=",round(cr,2)),x=rng[1]*3/4,y=rng[2]*3/4) + xlab("Effect of daf-2::1xAID\n(log2 fold-change)") + ylab("Effect of daf-2::3xAID\n(log2 fold-change)")
+ggsave("similarity_of_degrons_absent_TIR1.pdf",width=5,height=5)
+groups = c(r1,r2)
+res=lapply(groups,function(g){
+  any_sig_res[group==g&padj<.001&abs(log2FoldChange)>1,GeneName]
+})
+name_convert = c(N_N_1xAID="daf-2::1xAID",N_N_3xAID="daf-2::3xAID")
+names(res)=name_convert[groups]
+library(ggVennDiagram)
+ggVennDiagram(res, 
+              label_alpha=0, 
+              set_color = c("blue","red"),
+              label="count")+
+            ggplot2::scale_fill_gradient(low = "white", high = "white")+theme(legend.position="none")+scale_x_continuous(expand = expansion(mult = .2))
+ggsave("similarity_of_degrons_absent_TIR1_Venn_diagram.pdf",width=5,height=5)
+
+dat2 = dcast(any_sig_res[group%in%c(r1,r2),],GeneName~group,value.var="padj")
+dat3 = dat
+names(dat3)[2:3] = c("1xAID.log2FC","3xAID.log2FC")
+names(dat2)[2:3] = c("1xAID.padj","3xAID.padj")
+dat4 = merge(dat2,dat3,by=c("GeneName"))
+dat4 = dat4[,.(GeneName,GeneSymbol,`1xAID.log2FC`,`1xAID.padj`,`3xAID.log2FC`,`3xAID.padj`)]
+write.csv(dat4,"Suplementary Table 4 - degron_auxin-independent_effects.csv")
+```
+
+
+
+
+```{r}
+annots_aux_doub = annotations_aie[Biological_replicate==1,]
+
+genes_to_exclude = c("TIR1-DERNBERG")
+annots_aux_doub = counts[ rownames(counts)%!in%genes_to_exclude,annots_aux_ind$Sample]
+nf_aux_ind <- calculateSumFactors(counts_aux_ind)
+
+ind_Genotype_mapping = data.table(Genotype=c("eft3p::TIR1[F79G]",
+                                    "eft3p::TIR1[F79A]",
+                                    "daf2::AID::3xFLAG(codon optimized)",
+                                    "daf2::3xAID::3xFLAG(codon optimized)",
+                                    "eft3p::TIR1",
+                                    "eif3p::TIR1",
+                                    "N2"),
+                                  label=c("eft3p_F79G_0xAID",
+                                          "eft3p_F79A_0xAID",
+                                          "N_N_1xAID",
+                                          "N_N_3xAID",
+                                          "eif3p_F79F_0XAID",
+                                          "eft3p_F79F_0XAID",
+                                          "N_N_0xAID"))
+setkey(ind_Genotype_mapping,Genotype)
+annots_aux_ind$label = factor(ind_Genotype_mapping[annots_aux_ind$Genotype,label])
+annots_aux_ind$label = relevel(annots_aux_ind$label,"N_N_0xAID")
+dds_aux_ind<- DESeqDataSetFromMatrix(countData = counts_aux_ind,
+                                     colData = annots_aux_ind,
+                                     design = ~ label)
+sizeFactors(dds_aux_ind) <- nf_aux_ind # use scran normalization
+dds_aux_ind <- estimateDispersions(dds_aux_ind) # estimate overdispersion parameter
+dds_aux_ind <- nbinomWaldTest(dds_aux_ind) # run NB GLM and do Wald Test on coefficients
+
+results_aux_ind <- lapply(resultsNames(dds_aux_ind), function(i) {
+  r <- results(dds_aux_ind, name = i)
+  r <- as.data.table(r)
+  colnames(r) <- paste0(i, "_", colnames(r))
+  r
+})
+results_aux_ind2 = cbind(results_aux_ind[[1]],results_aux_ind[[2]],results_aux_ind[[3]],results_aux_ind[[4]],results_aux_ind[[5]],results_aux_ind[[6]],results_aux_ind[[7]])
+results_aux_ind2[, GeneName := rownames(counts_aux_ind)]
+
+results_aux_ind_long <- rbindlist(lapply(resultsNames(dds_aux_ind), function(i) {
+  r <- results(dds_aux_ind, name = i)
+  r <- as.data.table(r)
+  r[, GeneName := rownames(counts_aux_ind)]
+  r$covariate = i
+  r
+}))
+
+results_aux_ind_long[,group:=substring(covariate,7,nchar(covariate)-13)]
+results_aux_ind_long[,group:=ifelse(group=="","Intercept",group)]
+
+```
+
+
+```{r}
+#recalc the effects of double of each variant without auxin
+ref_group = "N2"
+annots2 = annotations_aie[Biological_replicate==1 & Auxin==F & Day==1,]
+genes_to_exclude = c("TIR1-DERNBERG")
+counts2 = counts[ rownames(counts)%!in%genes_to_exclude,annots2$Sample]
+nf2 <- calculateSumFactors(counts2)
+
+ind2e_mapping = data.table(Genotype=c("eft3p::TIR1[F79G]::mRuby; daf2::AID::3xFLAG(codon optimized)",
+                                      "eft3p::TIR1[F79G]::mRuby; daf2::3xAID::3xFLAG(codon optimized)",
+                                       "eft3p::TIR1[F79A]::mRuby; daf2::AID::3xFLAG(codon optimized)",
+                                      "eft3p::TIR1[F79A]::mRuby; daf2::3xAID::3xFLAG(codon optimized)",
+                                      "eif3Bp::TIR1; daf2::AID::3xFLAG(codon optimized)",
+                                      "eif3Bp::TIR1; daf2::3xAID::3xFLAG(codon optimized)",
+                                      "eft3p::TIR1::mRuby; daf2::AID::3xFLAG(codon optimized)",
+                                      "eft3p::TIR1::mRuby; daf2::3xAID::3xFLAG(codon optimized)",
+                                      "N2"),
+                                TIR1_type=c("eft3p..F79G.1xAID",
+                                      "eft3p..F79G.3xAID",
+                                      "eft3p..F79A.1xAID",
+                                      "eft3p..F79A.3xAID",
+                                      "eif3Bp..WT.1xAID",
+                                      "eif3Bp..WT.3xAID",
+                                      "eft3p..WT.1xAID",
+                                      "eft3p..WT.3xAID",
+                                      "N2"),
+                                  label=c("eft3p::TIR1(F79G) ; daf-2::1xAID",
+                                          "eft3p::TIR1(F79G) ; daf-2::3xAID",
+                                          "eft3p::TIR1(F79A) ; daf-2::1xAID",
+                                          "eft3p::TIR1(F79A) ; daf-2::3xAID",
+                                          "eif3Bp::TIR1(F79) ; daf-2::1xAID",
+                                          "eif3Bp::TIR1(F79) ; daf-2::3xAID",
+                                          "eft3p::TIR1(F79) ; daf-2::1xAID",
+                                          "eft3p::TIR1(F79) ; daf-2::3xAID",
+                                          "+ ; +"))
+
+ind2e_mapping$mangled_label = make.names(ind2e_mapping$label)
+setkey(ind2e_mapping,Genotype)
+annots2$label = factor(ind2e_mapping[annots2$Genotype,label])
+annots2$label = relevel(annots2$label,"+ ; +")
+dds_2<- DESeqDataSetFromMatrix(countData = counts2,
+                                     colData = annots2,
+                                     design = ~ label)
+sizeFactors(dds_2) <- nf2 # use scran normalization
+dds_2 <- estimateDispersions(dds_2) # estimate overdispersion parameter
+dds_2 <- nbinomWaldTest(dds_2) # run NB GLM and do Wald Test on coefficients
+
+results_2 <- lapply(resultsNames(dds_2), function(i) {
+  r <- results(dds_2, name = i)
+  r <- as.data.table(r)
+  colnames(r) <- paste0(i, "_", colnames(r))
+  r
+})
+
+results_2_long <- rbindlist(lapply(resultsNames(dds_2), function(i) {
+  r <- results(dds_2, name = i)
+  r <- as.data.table(r)
+  r[, GeneName := rownames(counts2)]
+  r$covariate = i
+  r
+}))
+results_2_long = results_2_long[covariate != "Intercept",]
+results_2_long[,group:=substring(covariate,7,nchar(covariate)-9)]
+
+```
+```{r}
+
+setkey(ind2e_mapping,mangled_label)
+results_2_long[,label :=ind2e_mapping[group,label]]
+results_2_long$GeneSymbol = geneid[results_2_long$GeneName,GeneSymbol]
+results_2_long$sig = results_2_long[,padj<.001 & abs(log2FoldChange)>1]
+results_2_long = results_2_long[!is.na(sig),]
+results_2_long[,covariate:=NULL]
+results_2_long[,baseMean :=NULL]
+results_2_long[,stat     :=NULL]
+fwrite(results_2_long,"Supplementary table 6 - TIR1;daf-2 effects no auxin.csv.gz",row.names=F)
+```
+
+
+```{r}
+#recalc the effects of double of each variant with auxin
+#this code has been replaced by code in "analyze_daf2_transcriptomics", replicated below
+if (0){
+ref_group = "N2"
+annots2 = annotations_aie[Biological_replicate==1 & Auxin==T & Day==1,]
+genes_to_exclude = c("TIR1-DERNBERG")
+counts2 = counts[ rownames(counts)%!in%genes_to_exclude,annots2$Sample]
+nf2 <- calculateSumFactors(counts2)
+
+ind2e_mapping$mangled_label = make.names(ind2e_mapping$label)
+setkey(ind2e_mapping,Genotype)
+annots2$label = factor(ind2e_mapping[annots2$Genotype,label])
+annots2$label = relevel(annots2$label,"+ ; +")
+dds_2<- DESeqDataSetFromMatrix(countData = counts2,
+                                     colData = annots2,
+                                     design = ~ label)
+sizeFactors(dds_2) <- nf2 # use scran normalization
+dds_2 <- estimateDispersions(dds_2) # estimate overdispersion parameter
+dds_2 <- nbinomWaldTest(dds_2) # run NB GLM and do Wald Test on coefficients
+}
+```
+
+
+```{r}
+if (0){
+#look for genes differentially regulated in the presence of auxin
+#SEPARATING CONTROLS
+#BUT THIS IS A FLAWED METHOD BECAUSE some effects of the compounds are eliminated by the presence of TIR1, and so
+#we can't use the compound as control.  this accounted for better by the multiple regression model, above
+auxin_types = unique(annotations_aie$AuxinType)
+ref="wo"
+auxin_types = auxin_types[auxin_types!=ref]
+deseq_res2 = rbindlist(lapply(unique(annotations_aie$AuxinType),function(aux_type){
+  annots_all = annotations_aie[ Day == 1 & daf2AID>=1 & Auxin == T & AuxinType==aux_type,]
+  strains = unique(annots_all$Strain)
+  rbindlist(lapply(strains,function(strain){
+  
+    print(paste(aux_type,strain))
+    annots2 = rbind(annots_all[Strain==strain,],
+                   annotations_aie[ Day == 1 & daf2AID>=1 & Auxin ==F &AuxinType==ref & Strain == strain,])
+    annots2[,Tir1_type := ifelse(Promoter=="wo","none",paste(Promoter,"::",Tir1,";",daf2AID,"xAID",sep=""))]
+    annots2[,Tir1_type_auxin := paste(Tir1_type,ifelse(Auxin,paste0("+",AuxinType),""))]
+    annots2$Tir1_type_f = relevel(factor(annots2$Tir1_type_auxin),ref=unique(annots2[Auxin==F,Tir1_type_auxin]))
+    print(annots2)
+    #browser()
+    daf2_effect_counts = counts[grepl("WB",rownames(counts)),annots2$Sample]
+    #r_means = rowMeans(daf2_effect_counts)
+   # r_zeros = apply(daf2_effect_counts,1,FUN=function(x)sum(x>0))
+    #counts_filtered = daf2_effect_counts[r_means>30 & r_zeros>3*ncol(daf2_effect_counts)/4,]
+   # nf = normalizationFactor(counts_filtered)
+    #deseq_res = runDESeq(counts_filtered,annots2,nf,~Tir1_type_f)
+    
+    nf2 <- calculateSumFactors(daf2_effect_counts)
+    deseq_res<- DESeqDataSetFromMatrix(countData = daf2_effect_counts,
+                                     colData = annots2,
+                                     design = ~ Tir1_type_f)
+    sizeFactors(deseq_res) <- nf2 # use scran normalization
+    deseq_res <- estimateDispersions(deseq_res) # estimate overdispersion parameter
+    deseq_res <- nbinomWaldTest(deseq_res) # run NB GLM and do Wald Test on coefficients
+
+    deseq_res2 =  rbindlist(lapply(DESeq2::resultsNames(deseq_res)[-1], function(i) {
+        r <- DESeq2::results(deseq_res, name = i)
+        r <- as.data.table(r)
+        r$covariate = i
+        r[, GeneName := rownames(deseq_res)]
+        r
+      }))
+    deseq_res2
+    }))
+}))
+
+
+results_2_individual_aux_effects_long = deseq_res2[covariate != "Intercept",]
+results_2_individual_aux_effects_long[,group:=substring(covariate,nchar("Tir1_type_f_")+1,lapply(gregexpr("_vs",covariate),function(x)x[1]-6))]
+results_2_individual_aux_effects_long$Auxin=T
+
+setkey(ind2e_mapping,TIR1_type)
+results_2_individual_aux_effects_long[,label :=ind2e_mapping[group,label]]
+results_2_individual_aux_effects_long$GeneSymbol = geneid[results_2_individual_aux_effects_long$GeneName,GeneSymbol]
+results_2_individual_aux_effects_long[,sig:=padj<.001 & abs(log2FoldChange)>1]
+results_2_individual_aux_effects_long = results_2_individual_aux_effects_long[!is.na(sig),]
+results_2_individual_aux_effects_long[,covariate:=NULL]
+results_2_individual_aux_effects_long[,baseMean :=NULL]
+results_2_individual_aux_effects_long[,stat     :=NULL]
+#fwrite(results_2_individual_aux_effects_long,"Supplementary table - activated TIR1;daf-2 effects.csv.gz",row.names=F)
+}
+
+```
+
+
+
+```{r}
+#recalc the effects of compounds
+ref_group = "N2"
+annots2 = annotations_aie[Biological_replicate==1 & Day==1 & is.na(Tir1) & daf2AID == 0,]
+genes_to_exclude = c("TIR1-DERNBERG")
+counts2 = counts[ rownames(counts)%!in%genes_to_exclude,annots2$Sample]
+nf2 <- calculateSumFactors(counts2)
+
+
+
+compound_mapping = data.table(compound=c("Aux",
+                                      "5ph",
+                                       "5ad",
+                                      "wo"),
+                                  label=c("KNAA","5-Ph-IAA","5-Ad-IAA","None"))
+
+compound_mapping$mangled_label = make.names(compound_mapping$label)
+
+setkey(compound_mapping,compound)
+annots2$label = factor(compound_mapping[annots2$AuxinType,label])
+annots2$label = relevel(annots2$label,"None")
+dds_2<- DESeqDataSetFromMatrix(countData = counts2,
+                                     colData = annots2,
+                                     design = ~ label)
+sizeFactors(dds_2) <- nf2 # use scran normalization
+dds_2 <- estimateDispersions(dds_2) # estimate overdispersion parameter
+dds_2 <- nbinomWaldTest(dds_2) # run NB GLM and do Wald Test on coefficients
+
+compound_results_2_long <- rbindlist(lapply(resultsNames(dds_2), function(i) {
+  r <- results(dds_2, name = i)
+  r <- as.data.table(r)
+  r[, GeneName := rownames(counts2)]
+  r$covariate = i
+  r
+}))
+compound_results_2_long = compound_results_2_long[covariate != "Intercept",]
+compound_results_2_long[,group:=substring(covariate,7,nchar(covariate)-8)]
+
+
+```
+
+```{r}
+setkey(compound_mapping,mangled_label)
+compound_results_2_long[,label := group]
+setkey(geneid,GeneName)
+compound_results_2_long$GeneSymbol = geneid[compound_results_2_long$GeneName,GeneSymbol]
+compound_results_2_long$sig = compound_results_2_long[,padj<.001 & abs(log2FoldChange)>1]
+compound_results_2_long = compound_results_2_long[!is.na(sig),]
+compound_results_2_long[,covariate:=NULL]
+compound_results_2_long[,baseMean :=NULL]
+compound_results_2_long[,stat     :=NULL]
+compound_results_2_long[,group     :=NULL]
+fwrite(compound_results_2_long,"Supplementary table - compound_effects.csv.gz",row.names=F)
+```
+
+
+
+```{r,fig.width=15,fig.height=5}
+#compare 'on-target" effects as analyzed using single or double regression models
+if (0){
+#effect of activated TIR1 compared using single regression models
+seperate_regressions = results_2_individual_aux_effects_long[grepl("1x",label) & grepl("eft3p",label),]
+seperate_regressions$TIR1 = seperate_regressions[,substring(label,13,16)]                             
+seperate_regressions[,TIR1 := ifelse(grepl(")",TIR1),"F79",TIR1)]   
+seperate_regressions$model = "single";
+seperate_regressions_wide = dcast(seperate_regressions,GeneName~TIR1,value.var="log2FoldChange")
+#make everything relative to F79F, which is how the cross model is set up
+seperate_regressions_wide[,F79A:=F79A -F79]
+seperate_regressions_wide[,F79G:=F79G -F79]
+seperate_regressions_wide_melt = melt(seperate_regressions_wide,id.vars="GeneName",variable.name="TIR1",value.name="log2FoldChange")
+seperate_regressions_wide_melt_both = merge(seperate_regressions,seperate_regressions_wide_melt,by=c("GeneName","TIR1"),suffixes=c(".variant_relative",".variant_absolute"))
+seperate_regressions_wide_melt_both[,log2FoldChange:=log2FoldChange.variant_absolute]
+
+#effect of activated TIR1 compared using a double model
+oduble_model_long = results_aux_other_variants_vs_F79_long[grepl("Tir1",group),]
+oduble_model_long$TIR1 = oduble_model_long[,substring(group,14,17)]                             
+oduble_model_long[,TIR1 := ifelse(TIR1=="none","F79",TIR1)]                               
+oduble_model_long[,log2FoldChange := -log2FoldChange]   
+oduble_model_long$model = "cross";
+
+compound_results_2_wide = dcast(compound_results_2_long,GeneName~label,value.var="log2FoldChange")
+
+
+all_reg = rbind(seperate_regressions_wide_melt_both,cross_model_long,fill=T)
+
+
+all_reg_wide_logFC = dcast(all_reg,GeneName+TIR1~model,value.var = "log2FoldChange")
+all_reg_wide_pv = dcast(all_reg,GeneName+TIR1~model,value.var = "padj")
+all_reg_wide_both = merge(x=all_reg_wide_logFC,y=all_reg_wide_pv,by=c("TIR1","GeneName"),suffixes=c(".logFC",".padj"))
+all_reg_wide_both[,sig:=ifelse(cross.padj < .01 | single.padj < .01,"sig","")]
+all_reg_wide_both_with_compound = merge(all_reg_wide_both,compound_results_2_wide,by="GeneName",allow.cartesian=TRUE)
+
+res = lapply(unique(all_reg_wide_both$TIR1),function(tir1){
+    d = all_reg_wide_both[TIR1==tir1 & sig=="sig",]
+    axis_lims = range(c(d$single.logFC,d$cross.logFC),na.rm=T)
+    cr = cor(d$single.logFC,d$cross.logFC,use="complete")
+    lm_res = lm(d$cross.logFC~d$single.logFC,na.rm=T)
+    list(cr = cr,
+         lm = lm_res,
+         gp = ggplot(d,aes(single.logFC,cross.logFC))+geom_point(alpha=.5)+geom_smooth(method="lm",se=F)+ 
+           xlab(paste(tir1,"single"))+
+           ylab(paste(tir1,"cross"))+
+           xlim(axis_lims)+ylim(axis_lims)+
+           annotate("text",label=paste0("rho=",round(cr,2)),x=axis_lims[1]*3/4,y=axis_lims[2]*3/4))
+})
+ggarrange(plotlist=list(res[[1]]$gp,res[[2]]$gp,res[[3]]$gp),nrow=1,ncol=3)
+}
+```
+
+
+```{r,fig.width=15,fig.height=5}
+if (0){
+#compare 'on-target" effects to compound effects
+tir1 = "F79"
+d=all_reg_wide_both_with_compound[TIR1==tir1 & sig=="sig",]
+axis_lims_x = range(c(d$single.logFC),na.rm=T)
+axis_lims_y = range(c(d$KNAA),na.rm=T)
+cr = cor(d$single.logFC,d$KNAA,use="complete")
+gp1=ggplot(d,aes(single.logFC,KNAA))+geom_point(alpha=.5)+geom_smooth(method="lm",se=F)+ 
+           xlab(paste(tir1,"single"))+
+           ylab(paste(tir1,"KNAA"))+
+           xlim(axis_lims_x)+ylim(axis_lims_y)+
+           annotate("text",label=paste0("rho=",round(cr,2)),x=axis_lims_x[1]*3/4,y=axis_lims_y[2]*3/4)
+
+tir1 = "F79G"
+d=all_reg_wide_both_with_compound[TIR1==tir1 & sig=="sig",]
+axis_lims_x = range(c(d$single.logFC),na.rm=T)
+axis_lims_y = range(c(d$`5.Ph.IAA`),na.rm=T)
+cr = cor(d$single.logFC,d$`5.Ph.IAA`,use="complete")
+gp2=ggplot(d,aes(single.logFC,`5.Ph.IAA`))+geom_point(alpha=.5)+geom_smooth(method="lm",se=F)+ 
+           xlab(paste(tir1,"single"))+
+           ylab(paste(tir1,"5.Ph.IAA"))+
+           xlim(axis_lims_x)+ylim(axis_lims_y)+
+           annotate("text",label=paste0("rho=",round(cr,2)),x=axis_lims_x[1]*3/4,y=axis_lims_y[2]*3/4)
+
+
+tir1 = "F79A"
+d=all_reg_wide_both_with_compound[TIR1==tir1 & sig=="sig",]
+axis_lims_x = range(c(d$single.logFC),na.rm=T)
+axis_lims_y = range(c(d$`5.Ad.IAA`),na.rm=T)
+cr = cor(d$single.logFC,d$`5.Ad.IAA`,use="complete")
+gp3=ggplot(d,aes(single.logFC,`5.Ad.IAA`))+geom_point(alpha=.5)+geom_smooth(method="lm",se=F)+ 
+           xlab(paste(tir1,"single"))+
+           ylab(paste(tir1,"5.Ad.IAA"))+
+           xlim(axis_lims_x)+ylim(axis_lims_y)+
+           annotate("text",label=paste0("rho=",round(cr,2)),x=axis_lims_x[1]*3/4,y=axis_lims_y[2]*3/4)
+
+ggarrange(plotlist=list(gp1,gp2,gp3),nrow=1,ncol=3)
+}
+```
+
+
+```{r,fig.width=15,fig.height=5}
+if (0){
+tir1 = "F79"
+d=all_reg_wide_both_with_compound[TIR1==tir1 & sig=="sig",]
+axis_lims = range(c(d$cross.logFC,d$cross.logFC),na.rm=T)
+cr = cor(d$cross.logFC,d$KNAA,use="complete")
+gp1=ggplot(d,aes(cross.logFC,KNAA))+geom_point(alpha=.5)+geom_smooth(method="lm",se=F)+ 
+           xlab(paste(tir1,"cross"))+
+           ylab(paste(tir1,"KNAA"))+
+           xlim(axis_lims)+ylim(axis_lims)+
+           annotate("text",label=paste0("rho=",round(cr,2)),x=axis_lims[1]*3/4,y=axis_lims[2]*3/4)
+
+tir1 = "F79G"
+d=all_reg_wide_both_with_compound[TIR1==tir1 & sig=="sig",]
+axis_lims = range(c(d$cross.logFC,d$cross.logFC),na.rm=T)
+cr = cor(d$cross.logFC,d$`5.Ph.IAA`,use="complete")
+gp2=ggplot(d,aes(cross.logFC,`5.Ph.IAA`))+geom_point(alpha=.5)+geom_smooth(method="lm",se=F)+ 
+           xlab(paste(tir1,"cross"))+
+           ylab(paste(tir1,"5.Ph.IAA"))+
+           xlim(axis_lims)+ylim(axis_lims)+
+           annotate("text",label=paste0("rho=",round(cr,2)),x=axis_lims[1]*3/4,y=axis_lims[2]*3/4)
+
+
+tir1 = "F79A"
+d=all_reg_wide_both_with_compound[TIR1==tir1 & sig=="sig",]
+axis_lims = range(c(d$cross.logFC,d$cross.logFC),na.rm=T)
+cr = cor(d$cross.logFC,d$`5.Ad.IAA`,use="complete")
+gp3=ggplot(d,aes(cross.logFC,`5.Ad.IAA`))+geom_point(alpha=.5)+geom_smooth(method="lm",se=F)+ 
+           xlab(paste(tir1,"cross"))+
+           ylab(paste(tir1,"5.Ad.IAA"))+
+           xlim(axis_lims)+ylim(axis_lims)+
+           annotate("text",label=paste0("rho=",round(cr,2)),x=axis_lims[1]*3/4,y=axis_lims[2]*3/4)
+
+ggarrange(plotlist=list(gp1,gp2,gp3),nrow=1,ncol=3)
+}
+```
+```{r}
+sig = .0001
+mag_cutoff = log2(1.5)
+d1 = fread("Supplementary table - compound_effects.csv.gz")
+d1$experiment = "compounds"
+d1$quantification_type = "TIR1-ambivalent" #effects of compound that may or may not be modulated by the presence of tir1
+
+d2 = fread("Supplementary table  - degron component effects.csv.gz")
+d2$experiment = "degron_single_components"
+d2$quantification_type = "relative_to_WT"
+
+d3 = fread("Supplementary table 6 - TIR1;daf-2 effects no auxin.csv.gz")
+d3$experiment = "degron_double_components"
+d3$quantification_type = "relative_to_WT"
+
+#this file contains both the compouned effects and the TIR1 effects calculated from the multiple regression model
+d4 = fread("Supplementary table - activated TIR1;daf-2 effects.csv.gz")
+d4$orig_label = d4$label
+d4_compound = d4[!grepl("AID",label),]
+d4_compound$experiment = "compounds"
+
+d4_TIR1= d4[grepl("AID",label),]
+d4_TIR1$experiment = "degron_double_components_compounds"
+d4_TIR1$label = paste(d4_TIR1$label,"+auxin")
+
+#to make venn diagrams we need to get the set of genes significantly regulated
+#in the double with the effects of compounds added in
+d4_TIR1_mixed_with_compound = d4;
+d4_compound_to_mix_1x = d4[!grepl("AID",label) & grepl(":AID",Genotype),]
+d4_compound_to_mix_1x[label == "KNAA", label := "eft3p::TIR1(F79) ; daf-2::1xAID"]
+d4_compound_to_mix_1x[label == "5-Ph-IAA", label := "eft3p::TIR1(F79G) ; daf-2::1xAID"]
+d4_compound_to_mix_1x[label == "5-Ad-IAA", label := "eft3p::TIR1(F79A) ; daf-2::1xAID"]
+d4_compound_to_mix_3x = d4[!grepl("AID",label) & grepl("3xAID",Genotype),]
+d4_compound_to_mix_3x[label == "KNAA", label := "eft3p::TIR1(F79) ; daf-2::3xAID"]
+d4_compound_to_mix_3x[label == "5-Ph-IAA", label := "eft3p::TIR1(F79G) ; daf-2::3xAID"]
+d4_compound_to_mix_3x[label == "5-Ad-IAA", label := "eft3p::TIR1(F79A) ; daf-2::3xAID"]
+d4_TIR1_and_compounds_mixed = rbind(d4[grepl("AID",label) & quantification_type == "relative_to_WT",],d4_compound_to_mix_1x,d4_compound_to_mix_3x)
+d4_TIR1_and_compounds_mixed$quantification_type = "TIR1_abs_plus_compound"
+d4_TIR1_and_compounds_mixed$experiment = "degron_double_components_compounds"
+d4_TIR1_and_compounds_mixed$label = paste(d4_TIR1_and_compounds_mixed$label,"+auxin")
+
+all_d = rbind(d1,d2,d3,d4_compound,d4_TIR1,d4_TIR1_and_compounds_mixed,fill=T)
+all_d[,group:=NULL]
+all_d[,Auxin:=NULL]
+all_d$sig = all_d$padj<sig & abs(all_d$log2FoldChange)>=mag_cutoff
+```
+
+
+
+```{r,fig.width=12,fig.height=12}
+library(ggVennDiagram)
+
+#decompose each TIR1 variant's activated effects into individual components
+all_d2 = all_d[ quantification_type%in%c("relative_to_WT","TIR1_abs_plus_compound","TIR1-ambivalent") & !grepl("3xAID",label),]
+
+tmp = all_d2[( experiment=="degron_single_components" & (grepl("eft3p",label) & grepl("F79F",label)) | grepl("N_N_.xAID",label)) ]
+
+d_eft3_F79 = all_d2[experiment=="degron_double_components_compounds"& grepl("eft3p",label) & grepl("F79\\)",label) |
+                  (experiment=="degron_double_components" & grepl("eft3p",label) & grepl("F79\\)",label))|
+                  ( experiment=="degron_single_components" & (grepl("eft3p",label) & grepl("F79F",label) | grepl("N_N_.xAID",label))) |
+                 ( experiment=="compounds" & label == "KNAA")]
+
+
+d_eft3_F79A = all_d2[experiment=="degron_double_components_compounds" & grepl("eft3p",label) & grepl("F79A",label) |
+                  (experiment=="degron_double_components" & grepl("eft3p",label) & grepl("F79A",label))|
+                  ( experiment=="degron_single_components" & (grepl("eft3p",label) & grepl("F79A",label) | grepl("N_N_.xAID",label))) |
+                 ( experiment=="compounds" & label == "5.Ad.IAA")]
+
+d_eft3_F79G = all_d2[experiment=="degron_double_components_compounds" & grepl("eft3p",label) & grepl("F79G",label) |
+                  (experiment=="degron_double_components" & grepl("eft3p",label) & grepl("F79G",label))|
+                  ( experiment=="degron_single_components" & (grepl("eft3p",label) & grepl("F79G",label) | grepl("N_N_.xAID",label))) |
+                 ( experiment=="compounds" & label == "5.Ph.IAA")]
+
+
+
+comp_VD = function (data,title,TIR1_name,compound_name){
+  #we want to plot as one of the categories the effect of TIR1 plus the effect of compound present when TIR1 is present
+  #so we select that data set using the tag "TIR1_abs_plus_compound"
+    res = list(unique(data[experiment=="degron_double_components_compounds" & quantification_type == "TIR1_abs_plus_compound" & sig==T,GeneName]),
+          unique(data[experiment=="degron_double_components" & sig==T,GeneName]),
+          unique(data[experiment=="degron_single_components" & grepl("1xAID",label) & sig==T,GeneName]),#daf2 degron alone
+          unique(data[experiment=="degron_single_components" & grepl("eft3p",label)& sig==T,GeneName]), #TIR1 alone
+          unique(data[experiment=="compounds" & sig==T,GeneName]) )
+    print(lapply(res,length))
+    names(res)=c(paste0(TIR1_name,"; DAF-2::AID\n+ ",compound_name),paste0(TIR1_name,"; DAF-2::AID\nBasal activity"),"DAF-2::AID\nalone",paste0(TIR1_name,"\nalone"),compound_name)
+    
+    
+    ggVennDiagram(res, 
+                  label_alpha=0, 
+                  set_color = c("black","#DDB418","#6DE1D2","#F75A5A","gray"),
+                  label="count", set_size = 3,label_size=4)+
+                ggplot2::scale_fill_gradient(low = "white", high = "white")+theme(legend.position="none")+ scale_x_continuous(expand = expansion(mult = .3))
+
+    
+}; 
+#comp_VD(d_eft3_F79,"F79","TIR1[F79]","KNAA")
+
+#venn_plot_all=comp_VD(all_d2,"Any Variant","TIR1[Any]","compounds")
+venn_plot_F79=comp_VD(d_eft3_F79,"F79","TIR1[F79]","KNAA")
+venn_plot_F79A=comp_VD(d_eft3_F79A,"F79A","TIR1[F79A]","5.Ad.IAA")
+venn_plot_F79G= comp_VD(d_eft3_F79G,"F79G","TIR1[F79G]","5.Ph.IAA")
+
+ggarrange(plotlist=list(venn_plot_F79,
+                        venn_plot_F79A,
+                       venn_plot_F79G))
+```
+
+```{r,fig.width=4,fig.height=4}
+library(ggVennDiagram)
+
+if (0){
+all_d2 = all_d[quantification_type%in%c("relative_to_WT","TIR1-ambivalent") & !grepl("3xAID",label),]
+
+d_eft3_F79s = all_d2[(experiment=="degron_double_components_compounds"& grepl("eft3p",label) & grepl("F79\\)",label))]
+
+d_eft3_F79As = all_d2[(experiment=="degron_double_components_compounds" & grepl("eft3p",label) & grepl("F79A",label))]
+
+d_eft3_F79Gs = all_d2[(experiment=="degron_double_components_compounds" & grepl("eft3p",label) & grepl("F79G",label))]
+
+#decompose each TIR1 variant's activated effects into individual components
+
+#This is not the correct way to do it, as we do not take into account the statistical significance of differences between the strains,
+#nor the differeing effects of compounds
+
+#the correct way to do this is with the double regression model above.
+    res = list(unique(d_eft3_F79s[sig==T,GeneName]),
+          unique(d_eft3_F79As[sig==T,GeneName]),
+          unique(d_eft3_F79Gs[sig==T,GeneName]) )
+    print(lapply(res,length))
+    names(res)=c("F79","F79A","F79G")
+    
+    
+    ggVennDiagram(res, 
+                  label_alpha=0, 
+                  set_color = c("black","#6DE1D2","#F75A5A"),
+                  label="count", set_size = 3,label_size=4)+
+                ggplot2::scale_fill_gradient(low = "white", high = "white")+theme(legend.position="none")+ scale_x_continuous(expand = expansion(mult = 1))
+
+}
+```
+
+```{r,fig.width=12,fig.height=12}
+if (0){
+com_stats = function(all_d,title){
+  bck = unique(c(all_d[experiment=="degron_double_components" & sig,GeneName],
+          all_d[experiment=="degron_single_components" & sig,GeneName],
+          all_d[experiment=="compounds" & sig,GeneName]));
+  fwd = unique(all_d[experiment=="degron_double_components_compounds" & sig,GeneName])
+  ot = setdiff(fwd,bck)
+  rmain = setdiff(bck,fwd)
+  d=data.table(All.activated=length(fwd),On.Target=length(ot),basal=length(bck),only.basal=length(rmain),title=title)
+  d$off.target=d$All.activated-d$On.Target
+  d[,.(title,On.Target,off.target,All.activated,basal, only.basal)]
+}
+all_stats = rbind( com_stats(all_d,"All variants"),
+      com_stats(d_eft3_F79,"F79F"),
+      com_stats(d_eft3_F79A,"F79A"),
+      com_stats(d_eft3_F79G,"F79G"))
+all_stats$percent_off = 1-all_stats$On.Target/all_stats$All.activated
+
+on_target_genes = function(all_d,background=NULL){
+  if (is.null(background)){
+    background = all_d;
+  }
+    bck = unique(c(background[experiment=="degron_double_components" & sig,GeneName],
+            background[experiment=="degron_single_components" & sig,GeneName],
+            background[experiment=="compounds" & sig,GeneName]));
+  
+  fwd = unique(all_d[experiment=="degron_double_components_compounds" & sig,GeneName])
+  ot = setdiff(fwd,bck)
+  list(on.target=ot,off.target=bck)
+}
+
+on_targ_genes = list(
+      F79F = on_target_genes(d_eft3_F79)$on.target,
+      F79A = on_target_genes(d_eft3_F79A)$on.target,
+      F79G = on_target_genes(d_eft3_F79G)$on.target)
+
+
+ggVennDiagram(on_targ_genes, 
+              label_alpha=0, 
+              set_color = c("blue","red","green"),
+              label="count")+
+            ggplot2::scale_fill_gradient(low = "white", high = "white")+theme(legend.position="none")+scale_x_continuous(expand = expansion(mult = 1.1)) 
+
+on_targ_genes_common_background = list(
+      F79F = on_target_genes(d_eft3_F79,background=all_d)$on.target,
+      F79A = on_target_genes(d_eft3_F79A,background=all_d)$on.target,
+      F79G = on_target_genes(d_eft3_F79G,background=all_d)$on.target)
+
+
+ggVennDiagram(on_targ_genes_common_background, 
+              label_alpha=0, 
+              set_color = c("blue","red","green"),
+              label="count")+
+            ggplot2::scale_fill_gradient(low = "white", high = "white")+theme(legend.position="none")+scale_x_continuous(expand = expansion(mult = 1.1)) 
+}
+
+```
+
+```{r}
+#compare the effects of each component to the overall effect seen in the double mutant plus compound
+
+sig_level = .0001;
+mag_cutoff = log2(1.5)
+
+if (any(aggregate(log2FoldChange~GeneName,d_eft3_F79[quantification_type == "TIR1_abs_plus_compound" ,],FUN=length)$log2FoldChange!=2))
+  stop("This data structure should have two of each genes: the effect of the compound (orig_label == compound name) and the effect of the TIR1 (orig_label == TIR1 variant0, which we need to add toggether get the overall effect")
+if (any(aggregate(log2FoldChange~GeneName,d_eft3_F79G[quantification_type == "TIR1_abs_plus_compound" ,],FUN=length)$log2FoldChange!=2))
+  stop("This data structure should have two of each genes: the effect of the compound (orig_label == compound name) and the effect of the TIR1 (orig_label == TIR1 variant0, which we need to add toggether get the overall effect")
+if (any(aggregate(log2FoldChange~GeneName,d_eft3_F79A[quantification_type == "TIR1_abs_plus_compound" ,],FUN=length)$log2FoldChange!=2))
+  stop("This data structure should have two of each genes: the effect of the compound (orig_label == compound name) and the effect of the TIR1 (orig_label == TIR1 variant0, which we need to add toggether get the overall effect")
+
+
+#this data is all comming from the fits to the original regression model
+#y = compound * TIR1 + e 
+#regression model
+#to get the overall effect of the AID system, here we add the compound effect terms to the ( TIR1 + compound*TIR1 ) effects calculated earlier and written to the supplementary file.
+d_eft3_F79_sum_FC = aggregate(log2FoldChange~GeneName+label+experiment,d_eft3_F79[quantification_type == "TIR1_abs_plus_compound" ,],FUN=sum)
+d_eft3_F79_min_pv = aggregate(padj~GeneName+label+experiment,d_eft3_F79[quantification_type == "TIR1_abs_plus_compound" ,],FUN=min)
+d_eft3_F79A_sum_FC = aggregate(log2FoldChange~GeneName+label+experiment,d_eft3_F79A[quantification_type == "TIR1_abs_plus_compound" ,],FUN=sum)
+d_eft3_F79A_min_pv = aggregate(padj~GeneName+label+experiment,d_eft3_F79A[quantification_type == "TIR1_abs_plus_compound" ,],FUN=min)
+d_eft3_F79G_sum_FC = aggregate(log2FoldChange~GeneName+label+experiment,d_eft3_F79G[quantification_type == "TIR1_abs_plus_compound" ,],FUN=sum)
+d_eft3_F79G_min_pv = aggregate(padj~GeneName+label+experiment,d_eft3_F79G[quantification_type == "TIR1_abs_plus_compound" ,],FUN=min)
+
+d_eft3_F79_merged = data.table(merge(d_eft3_F79_sum_FC,d_eft3_F79_min_pv,by=c("GeneName","label","experiment")))
+d_eft3_F79A_merged = data.table(merge(d_eft3_F79A_sum_FC,d_eft3_F79A_min_pv,by=c("GeneName","label","experiment")))
+d_eft3_F79G_merged = data.table(merge(d_eft3_F79G_sum_FC,d_eft3_F79G_min_pv,by=c("GeneName","label","experiment")))
+
+
+data = list(F79=rbind(d_eft3_F79_merged,d_eft3_F79[experiment != "degron_double_components_compounds",.(log2FoldChange,padj,GeneName,label,experiment)]), #on the x axis we want to plot "on target" effects not on on target + compound
+            F79G=rbind(d_eft3_F79G_merged,d_eft3_F79G[experiment != "degron_double_components_compounds",.(log2FoldChange,padj,GeneName,label,experiment)]),
+            F79A=rbind(d_eft3_F79A_merged,d_eft3_F79A[experiment != "degron_double_components_compounds",.(log2FoldChange,padj,GeneName,label,experiment)]));
+TIR1_expression_labels = c(F79="TIR1[F79] alone",
+                  F79G="TIR1[F79G] alone",
+                  F79A="TIR1[F79A] alone")
+TIR1_basal_labels = c(F79="TIR1[F79];DAF-2::AID\nBasal",
+                  F79G="TIR1[F79G];DAF-2::AID\nBasal",
+                  F79A="TIR1[F79A];DAF-2::AID\nBasal")
+compound_labels = c(F79="KNAA",
+                  F79G="5-Ph-IAA",
+                  F79A="5-Ad-IAA")
+double_labels = c(F79="TIR1[F79];DAF-2::AID\n+ KNAA",
+                  F79G="TIR1[F79G];DAF-2::AID\n+ 5-Ph-IAA",
+                  F79A="TIR1[F79A];DAF-2::AID\n+ 5-Ad-IAA")
+
+all_graphs = lapply(names(data),function(dat_name){
+  
+  axis_lims = c(-4,4)
+  dat = data[[dat_name]]
+  #crop effects to reasonable axes
+  dat[log2FoldChange<axis_lims[1],log2FoldChange:=axis_lims[1]]
+  dat[log2FoldChange>axis_lims[2],log2FoldChange:=axis_lims[2]]
+  
+  #make an additional, more informative label distinguishing the TIR1 alone from the DAF-2 alone
+  dat[,experiment2 := ifelse(experiment=="degron_single_components",
+                             ifelse(grepl("N_N",label),"DAF-2::AID alone","TIR1 alone"),
+                             experiment)]
+  
+  #make one big table with the effects for each gene in each condition as columns
+  res = dcast(dat,GeneName~experiment2,value.var="log2FoldChange",fun.aggregate=mean)
+  res_padj = dcast(dat,GeneName~experiment2,value.var="padj",fun.aggregate=mean)
+  res_merged = merge(res,res_padj,by="GeneName",suffixes=c(".Log2FC",".padj"))
+  
+  #make pretty axis labels
+  double_name = paste0(double_labels[dat_name]," (log2FC)")
+  compound_name = paste0(compound_labels[dat_name],"\n(log2FC)")
+  TIR1_basal_name = paste0(TIR1_basal_labels[dat_name]," (log2FC)")
+  TIR1_expression_name= paste0(TIR1_expression_labels[dat_name],"\n(log2FC)")
+  daf_2_tagging_name  = "DAF-2::AID alone\n(log2FC)"
+
+  #Compare compound to full activated system effects
+  res_merged2 = res_merged
+  res_merged2[,significance:=ifelse(compounds.padj < sig_level & degron_double_components_compounds.padj < sig_level &
+                                    abs(compounds.Log2FC) >= mag_cutoff & abs(degron_double_components_compounds.Log2FC) >= mag_cutoff  ,"Both",ifelse(compounds.padj < sig_level & abs(compounds.Log2FC) >= mag_cutoff,"Compound",ifelse(  degron_double_components_compounds.padj < sig_level & abs(degron_double_components_compounds.Log2FC) >= mag_cutoff ,double_name,"neither")))]
+  res_merged2 = res_merged2[!is.na(significance),]
+  colors = c("black","#88EEFF","red","gray")
+  sizes = c(1,1,2,1)
+  names(colors) = c(double_name,"Compound","Both","neither")
+  names(sizes) = c(double_name,"Compound","Both","neither")
+  print(table(res_merged2$significance))
+  cr =cor(res_merged2$degron_double_components_compounds.Log2FC,res_merged2$compounds.Log2FC,use="complete")
+  gp1=ggplot(res_merged2,aes(degron_double_components_compounds.Log2FC,compounds.Log2FC)) + 
+    
+    geom_point_rast(data=res_merged2[significance=="neither"],aes(fill=significance,size=significance),pch=21,color="black",alpha=.3,  raster.dpi=600) + 
+    geom_point_rast(data=res_merged2[significance!="neither"],aes(fill=significance,size=significance),pch=21,color="black",alpha=.7,  raster.dpi=600) + 
+    geom_smooth(method="lm",color="black",se=F) + geom_abline(intercept=0,slope=1,lty=2,col="dark gray")+xlab(double_name)+ylab(compound_name)+ scale_fill_manual(values=colors)+scale_size_manual(values=sizes)+theme(legend.position="none")+xlim(axis_lims[1],axis_lims[2])+ylim(axis_lims[1],axis_lims[2])+
+  annotate("text",label=paste0("rho=",round(cr,2)),x=axis_lims[1]*3/4,y=axis_lims[2]*3/4)
+  
+  #Compare DAF_2::AID alone to full activated system effects
+  #res_merged2 = res_merged[`DAF-2::AID alone.padj` < sig_level |  degron_double_components_compounds.padj < sig_level,]
+  res_merged2 = res_merged
+  res_merged2[,significance:=ifelse(`DAF-2::AID alone.padj` < sig_level & degron_double_components_compounds.padj < sig_level &
+                                     abs(`DAF-2::AID alone.Log2FC`)>mag_cutoff &  abs(degron_double_components_compounds.Log2FC)>=mag_cutoff,"Both",ifelse(`DAF-2::AID alone.padj` < sig_level& abs(`DAF-2::AID alone.Log2FC`) >=mag_cutoff,"DAF-2::AID",ifelse(  degron_double_components_compounds.padj < sig_level&  abs(degron_double_components_compounds.Log2FC)>=mag_cutoff,double_name,"neither")))]
+  res_merged2 = res_merged2[!is.na(significance),]
+  names(colors) = c(double_name,"DAF-2::AID","Both","neither")
+  names(sizes) = c(double_name,"DAF-2::AID","Both","neither")
+  cr =cor(res_merged2$degron_double_components_compounds.Log2FC,res_merged2$`DAF-2::AID alone.Log2FC`,use="complete")
+  table(res_merged2$significance)
+  daf2_degron_effects = res_merged2
+  gp2=ggplot(res_merged2,aes(degron_double_components_compounds.Log2FC,`DAF-2::AID alone.Log2FC`)) + 
+    geom_point_rast(data=res_merged2[significance=="neither"],aes(fill=significance,size=significance),pch=21,color="black",alpha=.3,  raster.dpi=600) + 
+    geom_point_rast(data=res_merged2[significance!="neither"],aes(fill=significance,size=significance),pch=21,color="black",alpha=.7,  raster.dpi=600) + 
+    geom_smooth(method="lm",color="black",se=F) + geom_abline(intercept=0,slope=1,lty=2,col="dark gray")+xlab(double_name)+ylab(daf_2_tagging_name)+ scale_fill_manual(values=colors)+scale_size_manual(values=sizes)+theme(legend.position="none")+xlim(axis_lims[1],axis_lims[2])+ylim(axis_lims[1],axis_lims[2])+
+  annotate("text",label=paste0("rho=",round(cr,2)),x=axis_lims[1]*3/4,y=axis_lims[2]*3/4)
+  
+  #Compare TIR1::AID alone to full activated system effects
+  #res_merged2 = res_merged[`TIR1 alone.padj` < sig_level |  degron_double_components_compounds.padj < sig_level,]
+  res_merged2 = res_merged
+  res_merged2[,significance:=ifelse(`TIR1 alone.padj` < sig_level & degron_double_components_compounds.padj < sig_level& abs(`TIR1 alone.Log2FC`)>=mag_cutoff & abs(degron_double_components_compounds.Log2FC)>=mag_cutoff,"Both",ifelse(`TIR1 alone.padj` < sig_level & abs(`TIR1 alone.Log2FC`)>=mag_cutoff,"TIR1",ifelse(  degron_double_components_compounds.padj < sig_level&abs(degron_double_components_compounds.Log2FC)>=mag_cutoff,double_name,"neither")))]
+  res_merged2 = res_merged2[!is.na(significance),]
+  names(colors) = c(double_name,"TIR1","Both","neither")
+  names(sizes) = c(double_name,"TIR1","Both","neither")
+  cr =cor(res_merged2$degron_double_components_compounds.Log2FC,res_merged2$`TIR1 alone.Log2FC`,use="complete")
+  gp3=ggplot(res_merged2,aes(degron_double_components_compounds.Log2FC,`TIR1 alone.Log2FC`)) + 
+    geom_point_rast(data=res_merged2[significance=="neither"],aes(fill=significance,size=significance),pch=21,color="black",alpha=.3,  raster.dpi=600) + 
+    geom_point_rast(data=res_merged2[significance!="neither"],aes(fill=significance,size=significance),pch=21,color="black",alpha=.7,  raster.dpi=600) + 
+     geom_smooth(method="lm",color="black",se=F) + geom_abline(intercept=0,slope=1,lty=2,col="dark gray")+xlab(double_name)+ylab(TIR1_expression_name)+ scale_fill_manual(values=colors)+scale_size_manual(values=sizes)+theme(legend.position="none")+xlim(axis_lims[1],axis_lims[2])+ylim(axis_lims[1],axis_lims[2])+
+  annotate("text",label=paste0("rho=",round(cr,2)),x=axis_lims[1]*3/4,y=axis_lims[2]*3/4)
+  
+  
+  
+  #Compare Double basal activity to full activated system effects
+  #res_merged2 = res_merged[degron_double_components.padj < sig_level |  degron_double_components_compounds.padj < sig_level,]
+  res_merged2= res_merged
+ # res_merged2[,significance:=ifelse(degron_double_components.padj < sig_level & degron_double_components_compounds.padj < sig_level,"Both",ifelse(degron_double_components.padj < sig_level,"TIR1+daf-2::AID",ifelse(  degron_double_components_compounds.padj < sig_level,double_name,"black")))]
+  res_merged2 = res_merged2[!is.na(significance),]
+  
+  names(colors) = c(double_name,"TIR1+daf-2::AID","Both","neither")
+  names(sizes) = c(double_name,"TIR1+daf-2::AID","Both","neither")
+  
+  
+  
+
+r_temp = res_merged2
+r_temp[,g:=2^(degron_double_components_compounds.Log2FC)]
+r_temp[,a:=2^(degron_double_components.Log2FC)]
+rfit = r_temp[!is.na(a) & !is.na(g),];
+lm_res = nlrob(a~g^c2,start=list(c2=4),data=rfit,method="MM",lower=c(c2=.1),upper=c(c2=10))
+
+m2=(coefficients(lm_res)["c2"])
+icp2 = 0
+
+#sd=confint2(lm_res,parm=c("c2"))
+sd = m2+ c(-1,1)*summary(lm_res)$coefficients[2]
+slope_str = paste0(round(m2,2)," (",round(sd[1],2),",",round(sd[2],2),")")
+
+#r_temp$residual = residuals(lm_res)
+#r_temp[significance%in%c("Both","F79"), significance:= "F79"]
+
+res_merged2[,significance:=ifelse(degron_double_components_compounds.padj < sig_level & degron_double_components.padj < sig_level &
+                                     abs(degron_double_components.Log2FC)>mag_cutoff &  abs(degron_double_components_compounds.Log2FC)>=mag_cutoff,"Both",
+                                  ifelse(degron_double_components.padj < sig_level& abs(degron_double_components.Log2FC),"Basal",
+                                  ifelse(degron_double_components_compounds.padj < sig_level& abs(degron_double_components_compounds.Log2FC),"Activated",
+                                         "neither")))]
+  table(res_merged2$significance)
+  #res_merged2 = res_merged2[!is.na(significance),]
+  colors = c("black","#88EEFF","red","gray")
+  sizes = c(1,1,2,1)
+  
+  names(colors) = c("Activated","Basal","Both","neither")
+  names(sizes) = c("Activated","Basal","Both","neither")                                                                                                          res_merged2 = res_merged2[!is.na(significance),]                       
+  
+cr =cor(res_merged2$degron_double_components_compounds.Log2FC,res_merged2$degron_double_components.Log2FC,use="complete")
+  gp4 = ggplot(res_merged2,aes(degron_double_components_compounds.Log2FC,degron_double_components.Log2FC)) + 
+    geom_point_rast(data=res_merged2[significance=="neither"],aes(fill=significance,size=significance),pch=21,color="black",alpha=.3,  raster.dpi=600) + 
+    geom_point_rast(data=res_merged2[significance!="neither"],aes(fill=significance,size=significance),pch=21,color="black",alpha=.7,  raster.dpi=600) + 
+   # geom_smooth(method="lm",color="black",se=F) + 
+    geom_abline(slope=m2,intercept=icp2,color="black") + 
+    geom_abline(intercept=0,slope=1,lty=2,col="dark gray")+
+    xlab(double_name)+ylab(TIR1_basal_name)+ scale_fill_manual(values=colors)+scale_size_manual(values=sizes)+theme(legend.position="none")+xlim(axis_lims[1],axis_lims[2])+ylim(axis_lims[1],axis_lims[2])+
+  annotate("text",label=paste0("rho: ",round(cr,2),"\nslope: ",slope_str),x=axis_lims[1]*3/4,y=axis_lims[2]*3/4)
+  
+  list(gp1,gp2,gp3,gp4,daf2_degron_effects)
+})
+names(all_graphs) = c("F79","F79G","F79A")
+```
+
+
+```{r,fig.width=18,fig.height=12}
+
+pl = list(all_graphs[["F79"]][[1]],all_graphs[["F79"]][[2]],all_graphs[["F79"]][[3]],all_graphs[["F79"]][[4]],venn_plot_F79,
+          all_graphs[["F79G"]][[1]],all_graphs[["F79G"]][[2]],all_graphs[["F79G"]][[3]],all_graphs[["F79G"]][[4]],venn_plot_F79G,
+          all_graphs[["F79A"]][[1]],all_graphs[["F79A"]][[2]],all_graphs[["F79A"]][[3]],all_graphs[["F79A"]][[4]],venn_plot_F79A)
+#,
+#       all_graphs[["F79G"]],
+ #          list(comp_VD(d_eft3_F79G,"F79G")))
+  #     all_graphs[["F79A"]])
+   #        list(comp_VD(d_eft3_F79A,"F79A")))
+
+ggarrange(plotlist=pl, nrow=3,ncol=5,
+          widths=c(1,1,1,1,1.5,1,1,1,1,1.5,1,1,1,1,1.5))
+ggsave("decomposing_degron_effects.pdf",width=18,height=12)
+
+
+
+
+```
+```{r}
+table(all_graphs[[1]][[5]][,significance])
+
+setkey(geneid,GeneName)
+tb = all_graphs[[1]][[5]][significance %in% c("Both","DAF-2::AID"),.(GeneName,significance,`DAF-2::AID alone.Log2FC`,degron_double_components_compounds.Log2FC),]
+tb$GeneSymbol = geneid[tb$GeneName,GeneSymbol]
+tb = tb[order(abs(tb$`DAF-2::AID alone.Log2FC`),decreasing=T),]
+tb
+
+```
+
+```{r}
+source("https://raw.githubusercontent.com/nstroustrup/asynch-seq-2024/refs/heads/main/scripts/helpers/enrichment_analysis.R")
+
+gene_annotations <- readRDS("gene_annotations.rds")
+gene_annotations <- gene_annotations[c("Wormcat", "Wormexp", "KEGG")]
+
+clean_enrich = function (on_target_genes,all_genes,databases){
+  g = lapply(databases, function(database) {
+   r = fisherEnrichment(gene_annotations[[database]], 
+                     data.table(GeneName=on_target_genes), 
+                     "Annotation", 
+                     universe = all_genes)
+   d = data.table(group=rownames(r[["qvalue"]]),pval=r[["pvalue"]],qval=r[["qvalue"]])
+   names(d)[2:3] = c("pval","qval")
+   d[order(d$qval,decreasing=F)]
+  })
+  names(g) = databases;
+  g
+}
+```
+
+
+```{r}
+#look at enrichment for unique effects of each degron variant in its "on target effects", e.g genes differentially regulated by each variant in the activated double
+#not explained by off target effects of any of the components
+#names(gene_annotations)
+
+on_targ_genes = list(all=shared_all,F79G=unique_to_F79G,F79A=unique_to_F79A,F79F=unique_to_F79,all_genes=all_eft3_genes) #xxx enrichent
+
+enrich_F79G_not_F79AF = clean_enrich(on_target_genes=on_targ_genes$F79G,all_genes=on_targ_genes$all_genes,names(gene_annotations))
+e_G = lapply(names(enrich_F79G_not_F79AF),function(x)enrich_F79G_not_F79AF[[x]][qval<.001,])
+names(e_G) = names(gene_annotations)
+enrich_F79A_not_F79GF = clean_enrich(on_target_genes=on_targ_genes$F79A,all_genes=on_targ_genes$all_genes,names(gene_annotations))
+e_A = lapply(names(enrich_F79A_not_F79GF),function(x)enrich_F79A_not_F79GF[[x]][qval<.001,])
+names(e_A) = names(gene_annotations)
+enrich_F79F_not_F79GA = clean_enrich(on_target_genes=on_targ_genes$F79,all_genes=on_targ_genes$all_genes,names(gene_annotations))
+e_F = lapply(names(enrich_F79F_not_F79GA),function(x)enrich_F79F_not_F79GA[[x]][qval<.001,])
+names(e_F) = names(gene_annotations)
+
+#unique to F79
+e_F$Wormexp$group
+#nothing
+
+#unique to F79G
+e_G$Wormexp$group
+#up by PA14, UV, N. parisii, nicotinic acid, DZN, dichlorvos
+#down in glp-4 mutant
+
+#unique to F79a
+e_A$Wormexp$group
+#PA14, N. parisii, glp-1, UV irridation, cadmium
+
+#note that there are no KEGG terms unique to any of the variants
+
+
+shared_among_all_TIR1_variants = clean_enrich(on_target_genes=on_targ_genes$all,on_targ_genes$all_genes,names(gene_annotations))
+e_intersect = lapply(names(shared_among_all_TIR1_variants),function(x)shared_among_all_TIR1_variants[[x]][qval<.001,])
+names(e_intersect) = names(gene_annotations)
+e_intersect$Wormexp  
+#huge enrichment for daf-2 targets across mutliple different experiments
+#germline effects
+#A huge number of Keggs
+
+activated_TIR1_shared_res_flat = 
+              rbindlist(lapply(names(shared_among_all_TIR1_variants),function(database){
+                r = shared_among_all_TIR1_variants[[database]]
+                r$database = database;
+                r[r$pval<.001,]
+              }))
+activated_TIR1_shared_res_flat$subject = "Common to all TIR1 Variants"
+activated_TIR1_shared_res_flat$analysis = "Activated TIR1 Effects"
+
+specific_list = list(`F79GA specific` = enrich_F79GA_not_F79F,
+                     `F79 specific` = enrich_F79F_not_F79GA)
+
+activated_TIR1_specific_res_flat = rbindlist(lapply(names(specific_list),function(TIR1){
+              rbindlist(lapply(names(specific_list[[TIR1]]),function(database){
+                r = specific_list[[TIR1]][[database]]
+                r$subject = TIR1
+                r$database = database;
+                r[r$pval<.001,]
+              }))
+}))
+activated_TIR1_specific_res_flat$analysis = "Activated TIR1 Effects"
+
+```
+
+```{r}
+#look at enrichment for off-target effects of compounds
+
+compound_res = all_d[experiment=="compounds"&quantification_type=="TIR1-ambivalent"]
+      
+cps = unique(compound_res$label)
+
+cps_sig_genes = lapply(cps,function(cp){
+    compound_res[padj<.01&label==cp,GeneName]
+})
+names(cps_sig_genes) = cps;
+     
+ggVennDiagram(cps_sig_genes, 
+              label_alpha=0, 
+              set_color = c("blue","red","green"),
+              label="count")+
+            ggplot2::scale_fill_gradient(low = "white", high = "white")+theme(legend.position="none")+scale_x_continuous(expand = expansion(mult = 1.1))                                      
+                                    
+cps_res = lapply(cps,function(cp){
+  enr = clean_enrich(on_target_genes=compound_res[sig&label==cp,GeneName],
+                     all_genes=compound_res$GeneName,
+                     databases=names(gene_annotations))
+})
+names(cps_res) = cps
+
+
+cps_res$KNAA$Wormexp
+#Up by B. licheniformis, 
+#crh-1(tz2) mutant which influences descrimination between  (S. aureus) and an opportunistic pathogen (P. mirabilis) 
+#https://www.sciencedirect.com/science/article/pii/S0171298516304624
+#fasting (effecting feeding behavior
+#genes down in nhr-114(RNAi), Probable transcription factor which may have a role in detoxifying dietary metabolites arising from bacterial tryptophan metabolism (PubMed:23499532).
+#down in daf-2, down in glp-1 (slight germline effect)
+cps_res$KNAA$KEGG
+#TGF-beta signalling, lysomomal function, ctochrome C
+cps_res$KNAA$Wormcat
+#C-type lectin
+cps_res$`5.Ph.IAA`$Wormexp
+#up by albendazole exposure
+#up by p. aeruginosa PA14
+# mdt-15 RNAi (modulating fatty acid metablism)
+cps_res$`5.Ad.IAA`$Wormexp
+#UP by B. licheniformis 141
+#Changed Y. pestis vs. E. coli
+#UP by PA14, 12h
+
+cps_res_flat = rbindlist(lapply(names(cps_res),function(compound){
+              rbindlist(lapply(names(cps_res[[compound]]),function(database){
+                r = cps_res[[compound]][[database]]
+                r$subject = compound
+                r$database = database;
+                r[r$pval<.001,]
+              }))
+}))
+cps_res_flat$analysis = "Individual Effect of compounds"
+
+
+enrich_KNAA_NOT_PhAd = clean_enrich(on_target_genes=setdiff(compound_res[sig&label=="KNAA",GeneName],c(compound_res[sig&label!="KNAA",GeneName])),all_genes=unlist(on_targ_genes),names(gene_annotations))
+
+
+enrich_shared_all_compounds = clean_enrich(on_target_genes=c(compound_res[sig&label=="5.Ad.IAA",GeneName],compound_res[sig&label=="5.Ph.IAA",GeneName],compound_res[sig&label=="KNAA",GeneName]),all_genes=unlist(on_targ_genes),names(gene_annotations))
+
+enrich_PhAd_NOT_KNAA = clean_enrich(on_target_genes=setdiff(intersect(compound_res[sig&label=="5.Ad.IAA",GeneName],compound_res[sig&label=="5.Ph.IAA",GeneName]),compound_res[sig&label=="KNAA",GeneName]),all_genes=unlist(on_targ_genes),names(gene_annotations))
+
+
+specific_list = list(`5.Ph_5.Ad specific` = enrich_PhAd_NOT_KNAA,
+                     `KNAA specific` = enrich_KNAA_NOT_PhAd,
+                     `shared all compounds` = enrich_shared_all_compounds)
+
+cps_specific_res_flat = rbindlist(lapply(names(specific_list),function(group){
+              rbindlist(lapply(names(specific_list[[group]]),function(database){
+                r = specific_list[[group]][[database]]
+                r$subject = group
+                r$database = database;
+                r[r$pval<.001,]
+              }))
+}))
+cps_specific_res_flat$analysis = "Differential Effect of compounds"
+
+```
+
+
+
+
+```{r}
+#look at enrichment for off-target effects of single TIR1 components 
+
+single_res = all_d[experiment=="degron_single_components"]
+lbls = unique(single_res$label)
+
+single_res_sig_genes = lapply(lbls,function(lb){
+  single_res[sig&label==lb,GeneName]
+})
+names(single_res_sig_genes) = lbls;
+
+single_res_sig_genes = lapply(lbls,function(lb){
+  single_res[sig&label==lb,GeneSymbol]
+})
+names(single_res_sig_genes) = lbls;
+#eft3p_F79G_0xAID effecting vitilogennins
+
+ggVennDiagram(single_res_sig_genes[c("eft3p_F79G_0xAID","eft3p_F79F_0XAID","eft3p_F79A_0xAID")], 
+              label_alpha=0, 
+              set_color = c("blue","red","green"),
+              label="count")+
+            ggplot2::scale_fill_gradient(low = "white", high = "white")+theme(legend.position="none")+scale_x_continuous(expand = expansion(mult = 1.1)) 
+
+
+s_res = lapply(lbls,function(lb){
+  enr = clean_enrich(on_target_genes=single_res[sig&label==lb,GeneName],
+                     all_genes=single_res$GeneName,
+                     databases=names(gene_annotations))
+})
+names(s_res) = lbls
+
+s_res_sig = lapply(lbls,function(lb){
+          lapply(s_res[[lb]],function(b) b[qval<.001,])
+})
+names(s_res_sig) = lbls
+
+all_TIR1_single = unique(unlist(single_res_sig_genes[c("eft3p_F79G_0xAID","eft3p_F79F_0XAID","eft3p_F79A_0xAID")]))
+
+enrich_F79G_not_F79AF_SC = clean_enrich(on_target_genes=setdiff(single_res_sig_genes$eft3p_F79G_0xAID,c(single_res_sig_genes$eft3p_F79F_0XAID,single_res_sig_genes$eft3p_F79A_0xAID)),all_genes=all_TIR1_single,names(gene_annotations))
+e_G_SC = lapply(names(enrich_F79G_not_F79AF_SC),function(x)enrich_F79G_not_F79AF_SC[[x]][qval<.001,])
+names(e_G_SC) = names(gene_annotations)
+
+
+enrich_F79A_not_F79GF_SC = clean_enrich(on_target_genes=setdiff(single_res_sig_genes$eft3p_F79A_0xAID,c(single_res_sig_genes$eft3p_F79F_0XAID,single_res_sig_genes$eft3p_F79G_0xAID)),all_genes=all_TIR1_single,names(gene_annotations))
+e_A_SC = lapply(names(enrich_F79A_not_F79GF_SC),function(x)enrich_F79A_not_F79GF_SC[[x]][qval<.001,])
+names(e_A_SC) = names(gene_annotations)
+#nothing
+
+F79F_not_F79AG_SC_genes = setdiff(single_res_sig_genes$eft3p_F79F_0XAID,c(single_res_sig_genes$eft3p_F79A_0xAID,single_res_sig_genes$eft3p_F79G_0xAID))
+enrich_F79F_not_F79AG_SC = clean_enrich(on_target_genes=F79F_not_F79AG_SC_genes,all_genes=all_TIR1_single,names(gene_annotations))
+e_F_SC = lapply(names(enrich_F79F_not_F79AG_SC),function(x)enrich_F79F_not_F79AG_SC[[x]][qval<.001,])
+names(e_F_SC) = names(gene_annotations)
+#nothing
+
+F79GA_not_F79F_SC_genes = setdiff(intersect(single_res_sig_genes$eft3p_F79A_0xAID,single_res_sig_genes$eft3p_F79G_0xAID),single_res_sig_genes$eft3p_F79F_0XAID)
+enrich_F79GA_not_F79F_SC = clean_enrich(on_target_genes=F79GA_not_F79F_SC_genes,all_genes=all_TIR1_single,names(gene_annotations))
+e_GA_SC = lapply(names(enrich_F79F_not_F79AG_SC),function(x)enrich_F79F_not_F79AG_SC[[x]][qval<.001,])
+names(e_GA_SC) = names(gene_annotations)
+
+
+specific_list = list(`F79GA specific` = F79F_not_F79AG_SC_genes,
+                     `F79 specific` = enrich_F79F_not_F79AG_SC)
+
+basal_TIR1_specific_res_flat = rbindlist(lapply(names(specific_list),function(TIR1){
+              rbindlist(lapply(names(specific_list[[TIR1]]),function(database){
+                r = specific_list[[TIR1]][[database]]
+                r$subject = TIR1
+                r$database = database;
+                r[r$pval<.001,]
+              }))
+}))
+#nothing!
+basal_TIR1_specific_res_flat$analysis = "Basal TIR1 Effects"
+
+
+shared_among_all_TIR1_variants_SC = clean_enrich(on_target_genes=intersect(single_res_sig_genes$F79F,intersect(single_res_sig_genes$F79G,single_res_sig_genes$F79A)),all_genes=all_d$GeneName,names(gene_annotations))
+
+basal_TIR1_shared_res_flat = 
+              rbindlist(lapply(names(shared_among_all_TIR1_variants_SC),function(database){
+                r = shared_among_all_TIR1_variants[[database]]
+                r$database = database;
+                r[r$pval<.001,]
+              }))
+basal_TIR1_shared_res_flat$subject = "Common to all TIR1 Variants"
+basal_TIR1_shared_res_flat$analysis = "Basal TIR1 Effects"
+
+
+#all: To few genes for a good wormExp
+enrich_F79G = clean_enrich(on_target_genes=single_res_sig_genes$eft3p_F79G_0xAID,all_genes=all_d$GeneName,names(gene_annotations))
+e_G_only_SC = lapply(names(enrich_F79G),function(x)enrich_F79G[[x]][qval<.001,])
+names(e_G_only_SC) = names(gene_annotations)
+#wormcat: C-type lectin lipases, collagens, 
+#lysosome
+
+
+enrich_F79A = clean_enrich(on_target_genes=single_res_sig_genes$eft3p_F79A_0xAID,all_genes=all_d$GeneName,names(gene_annotations))
+e_A_only_SC = lapply(names(enrich_F79A),function(x)enrich_F79A[[x]][qval<.001,])
+names(e_A_only_SC) = names(gene_annotations)
+#wormcat: Stress response: pathogen: unassigned
+
+enrich_F79F = clean_enrich(on_target_genes=single_res_sig_genes$eft3p_F79F_0XAID,all_genes=all_d$GeneName,names(gene_annotations))
+e_F_only_SC = lapply(names(enrich_F79F),function(x)enrich_F79F[[x]][qval<.001,])
+names(e_F_only_SC) = names(gene_annotations)
+```
+```{r}
+all_enrichment_results = rbind(
+cps_res_flat,
+activated_TIR1_shared_res_flat,
+activated_TIR1_specific_res_flat,
+basal_TIR1_shared_res_flat,
+basal_TIR1_specific_res_flat,
+cps_specific_res_flat
+)
+fwrite(all_enrichment_results,"Supplementary table enrichment.csv.gz")
+fwrite(all_enrichment_results,"Supplementary table enrichment.csv")
+```
+
+```{r}
+#look at daf-2 degron
+
+single_res = all_d[experiment=="degron_single_components" & grepl("N_N_3",label) |
+                   experiment=="degron_double_components" ,]
+lbls = unique(single_res$label)
+
+single_res_sig_genes = lapply(lbls,function(lb){
+  single_res[sig&label==lb,GeneName]
+})
+names(single_res_sig_genes) = lbls;
+
+single_res_sig_genes = lapply(lbls,function(lb){
+  single_res[sig&label==lb,GeneSymbol]
+})
+names(single_res_sig_genes) = lbls;
+#eft3p_F79G_0xAID effecting vitilogennins
+
+ggVennDiagram(single_res_sig_genes[c("eft3p_F79G_0xAID","eft3p_F79F_0XAID","eft3p_F79A_0xAID")], 
+              label_alpha=0, 
+              set_color = c("blue","red","green"),
+              label="count")+
+            ggplot2::scale_fill_gradient(low = "white", high = "white")+theme(legend.position="none")+scale_x_continuous(expand = expansion(mult = 1.1)) 
+
+
+s_res = lapply(lbls,function(lb){
+  enr = clean_enrich(on_target_genes=single_res[sig&label==lb,GeneName],
+                     all_genes=single_res$GeneName,
+                     databases=names(gene_annotations))
+})
+names(s_res) = lbls
+
+s_res_sig = lapply(lbls,function(lb){
+          lapply(s_res[[lb]],function(b) b[qval<.001,])
+})
+names(s_res_sig) = lbls
+
+all_TIR1_single = unique(unlist(single_res_sig_genes[c("eft3p_F79G_0xAID","eft3p_F79F_0XAID","eft3p_F79A_0xAID")]))
+
+enrich_F79G_not_F79AF_SC = clean_enrich(on_target_genes=setdiff(single_res_sig_genes$eft3p_F79G_0xAID,c(on_targ_genes$eft3p_F79F_0XAID,on_targ_genes$eft3p_F79A_0xAID)),all_genes=all_TIR1_single,names(gene_annotations))
+e_G_SC = lapply(names(enrich_F79G_not_F79AF_SC),function(x)enrich_F79G_not_F79AF_SC[[x]][qval<.001,])
+names(e_G_SC) = names(gene_annotations)
+#nothing
+
+enrich_F79A_not_F79GF_SC = clean_enrich(on_target_genes=setdiff(single_res_sig_genes$eft3p_F79A_0xAID,c(on_targ_genes$eft3p_F79F_0XAID,on_targ_genes$eft3p_F79G_0xAID)),all_genes=all_TIR1_single,names(gene_annotations))
+e_A_SC = lapply(names(enrich_F79A_not_F79GF_SC),function(x)enrich_F79A_not_F79GF_SC[[x]][qval<.001,])
+names(e_A_SC) = names(gene_annotations)
+#nothing
+enrich_F79F_not_F79AG_SC = clean_enrich(on_target_genes=setdiff(single_res_sig_genes$eft3p_F79F_0xAID,c(on_targ_genes$eft3p_F79A_0XAID,on_targ_genes$eft3p_F79G_0xAID)),all_genes=all_TIR1_single,names(gene_annotations))
+e_F_SC = lapply(names(enrich_F79F_not_F79AG_SC),function(x)enrich_F79F_not_F79AG_SC[[x]][qval<.001,])
+names(e_F_SC) = names(gene_annotations)
+#nothing
+
+
+#all: To few genes for a good wormExp
+enrich_F79G = clean_enrich(on_target_genes=single_res_sig_genes$eft3p_F79G_0xAID,all_genes=all_d$GeneName,names(gene_annotations))
+e_G_only_SC = lapply(names(enrich_F79G),function(x)enrich_F79G[[x]][qval<.001,])
+names(e_G_only_SC) = names(gene_annotations)
+#wormcat: C-type lectin lipases, collagens, 
+#lysosome
+
+
+enrich_F79A = clean_enrich(on_target_genes=single_res_sig_genes$eft3p_F79A_0xAID,all_genes=all_d$GeneName,names(gene_annotations))
+e_A_only_SC = lapply(names(enrich_F79A),function(x)enrich_F79A[[x]][qval<.001,])
+names(e_A_only_SC) = names(gene_annotations)
+#wormcat: Stress response: pathogen: unassigned
+
+enrich_F79F = clean_enrich(on_target_genes=single_res_sig_genes$eft3p_F79F_0XAID,all_genes=all_d$GeneName,names(gene_annotations))
+e_F_only_SC = lapply(names(enrich_F79F),function(x)enrich_F79F[[x]][qval<.001,])
+names(e_F_only_SC) = names(gene_annotations)
+
+#all: To few genes for a good wormExp
+enrich_F79G = clean_enrich(on_target_genes=single_res_sig_genes$eft3p_F79G_0xAID,all_genes=all_d$GeneName,names(gene_annotations))
+e_G_only_SC = lapply(names(enrich_F79G),function(x)enrich_F79G[[x]][qval<.001,])
+names(e_G_only_SC) = names(gene_annotations)
+#wormcat: C-type lectin lipases, collagens, 
+#lysosome
+
+
+enrich_F79A = clean_enrich(on_target_genes=single_res_sig_genes$eft3p_F79A_0xAID,all_genes=all_d$GeneName,names(gene_annotations))
+e_A_only_SC = lapply(names(enrich_F79A),function(x)enrich_F79A[[x]][qval<.001,])
+names(e_A_only_SC) = names(gene_annotations)
+#wormcat: Stress response: pathogen: unassigned
+
+intersect(single_res_sig_genes$eft3p_F79F_0XAID,intersect(single_res_sig_genes$eft3p_F79A_0xAID,single_res_sig_genes$eft3p_F79G_0xAID))
+
+```
+
+
+```{r}
+#look at daf-2 hypomorph for R2R
+#look at effect of TIR1 variant
+
+doubles = c("eft3p::TIR1::mRuby; daf2::AID::3xFLAG(codon optimized)",
+            "eft3p::TIR1::mRuby; daf2::3xAID::3xFLAG(codon optimized)"#,
+           # "eif3Bp::TIR1; daf2::3xAID::3xFLAG(codon optimized)" ,
+           # "eif3Bp::TIR1; daf2::AID::3xFLAG(codon optimized)",
+           # "eft3p::TIR1[F79G]::mRuby; daf2::3xAID::3xFLAG(codon optimized)",
+           # "eft3p::TIR1[F79A]::mRuby; daf2::3xAID::3xFLAG(codon optimized)",
+          #  "eft3p::TIR1[F79G]::mRuby; daf2::AID::3xFLAG(codon optimized)",
+           # "eft3p::TIR1[F79A]::mRuby; daf2::AID::3xFLAG(codon optimized)"
+          )
+
+annots_TIR1_basal = annotations_aie[Biological_replicate==1 & Auxin==F & Genotype %in% c("N2",doubles)&Day ==7,]
+
+genes_to_exclude = c("TIR1-DERNBERG")
+counts_TIR1_basal = counts[ rownames(counts)%!in%genes_to_exclude,annots_TIR1_basal$Sample]
+nf_TIR1_basal<- calculateSumFactors(counts_TIR1_basal)
+
+annots_TIR1_basal$label = factor(ifelse(annots_TIR1_basal$Genotype != "N2","TIR1","N2"))
+annots_TIR1_basal$label = relevel(annots_TIR1_basal$label,"N2")
+dds_TIR1_basal<- DESeqDataSetFromMatrix(countData = counts_TIR1_basal,
+                                     colData = annots_TIR1_basal,
+                                     design = ~ label)
+sizeFactors(dds_TIR1_basal) <- nf_TIR1_basal # use scran normalization
+dds_TIR1_basal <- estimateDispersions(dds_TIR1_basal) # estimate overdispersion parameter
+dds_TIR1_basal <- nbinomWaldTest(dds_TIR1_basal) # run NB GLM and do Wald Test on coefficients
+
+results_TIR1_basal <- lapply(resultsNames(dds_TIR1_basal), function(i) {
+  r <- results(dds_TIR1_basal, name = i)
+  r <- as.data.table(r)
+  colnames(r) <- paste0(i, "_", colnames(r))
+  r
+})
+results_TIR1_basal = cbind(dds_TIR1_basal[[1]],results_TIR1_basal[[2]])
+results_TIR1_basal[, GeneName := rownames(counts_TIR1_basal)]
+
+results_TIR1_basal_long <- rbindlist(lapply(resultsNames(dds_TIR1_basal), function(i) {
+  r <- results(dds_TIR1_basal, name = i)
+  r <- as.data.table(r)
+  r[, GeneName := rownames(counts_TIR1_basal)]
+  r$covariate = i
+  r
+}))
+
+results_TIR1_basal_long[,group:=substring(covariate,7,nchar(covariate))]
+results_TIR1_basal_long[,group:=ifelse(group=="ept","Intercept",group)]
+results_TIR1_basal_long = results_TIR1_basal_long[group!="Intercept",]
+
+#on target effects
+annots_TIR1_basal2 = annotations_aie[Biological_replicate==1 & Auxin==T & Genotype %in% c("N2",doubles) & (is.na(AuxinType) | AuxinType=="Aux") &Day ==7,]
+
+genes_to_exclude = c("TIR1-DERNBERG")
+counts_TIR1_basal2 = counts[ rownames(counts)%!in%genes_to_exclude,annots_TIR1_basal2$Sample]
+nf_TIR1_basal2<- calculateSumFactors(counts_TIR1_basal2)
+
+annots_TIR1_basal2$label = factor(ifelse(annots_TIR1_basal2$Genotype != "N2","TIR1","N2"))
+annots_TIR1_basal2$label = relevel(annots_TIR1_basal2$label,"N2")
+dds_TIR1_basal2<- DESeqDataSetFromMatrix(countData = counts_TIR1_basal2,
+                                     colData = annots_TIR1_basal2,
+                                     design = ~ label)
+sizeFactors(dds_TIR1_basal2) <- nf_TIR1_basal2# use scran normalization
+dds_TIR1_basal2 <- estimateDispersions(dds_TIR1_basal2) # estimate overdispersion parameter
+dds_TIR1_basal2 <- nbinomWaldTest(dds_TIR1_basal2) # run NB GLM and do Wald Test on coefficients
+
+results_TIR1_basal2 <- lapply(resultsNames(dds_TIR1_basal2), function(i) {
+  r <- results(dds_TIR1_basal2, name = i)
+  r <- as.data.table(r)
+  colnames(r) <- paste0(i, "_", colnames(r))
+  r
+})
+results_TIR1_basal2 = cbind(results_TIR1_basal2[[1]],results_TIR1_basal2[[2]])
+results_TIR1_basal2[, GeneName := rownames(counts_TIR1_basal2)]
+
+results_TIR1_basal2_long <- rbindlist(lapply(resultsNames(dds_TIR1_basal2), function(i) {
+  r <- results(dds_TIR1_basal2, name = i)
+  r <- as.data.table(r)
+  r[, GeneName := rownames(counts_TIR1_basal2)]
+  r$covariate = i
+  r
+}))
+
+results_TIR1_basal2_long[,group:=substring(covariate,7,nchar(covariate))]
+results_TIR1_basal2_long[,group:=ifelse(group=="ept","Intercept",group)]
+results_TIR1_basal2_long = results_TIR1_basal2_long[group!="Intercept",]
+```
+
+```{r}
+
+results_TIR1_basal_long$effect = "Basal Effect"
+results_TIR1_basal2_long$effect = "Activated effect"
+
+res  = merge(results_TIR1_basal_long[,.(GeneName,effect,log2FoldChange)],results_TIR1_basal2_long[,.(GeneName,effect,log2FoldChange)],by="GeneName",suffixes=c(".Basal",".Activated"))
+
+ggplot(res,aes(log2FoldChange.Basal,log2FoldChange.Activated)) + geom_point() + geom_smooth(method="lm",color="red",se=F)
+```
+

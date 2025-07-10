@@ -1,0 +1,1501 @@
+```{r}
+library(data.table)
+library(DESeq2)
+library(devtools)
+library(ggrepel)
+library(pbapply)
+library(cowplot)
+source_url("https://raw.githubusercontent.com/nstroustrup/asynch-seq-2024/main/scripts/helpers/differential_analysis.R")
+source_url("https://raw.githubusercontent.com/nstroustrup/asynch-seq-2024/main/scripts/helpers/preprocess.R")
+source_url("https://raw.githubusercontent.com/nstroustrup/asynch-seq-2024/main/scripts/helpers/gene_variability.R")
+library(ggplot2)
+
+theme_set(theme_cowplot())
+
+geneid= fread(r"(Z:\microscopy\sequence_data\reference\annotations\c_elegans.PRJNA13758.WS265.functional_descriptions.csv)")
+names(geneid)[1] = "GeneName"
+names(geneid)[2] = "GeneSymbol"
+```
+
+```{r}
+if (0){
+setwd(r"(z:\microscopy\sequence_data\202011_rbp2_degron)")
+annotations_2 = fread("data/annotations/sample_annotations.csv")
+fwrite(annotations_2,"c:/tmp/annotations.csv")
+
+
+
+counts2_long=fread("data/annotated_counts/counts.csv.gz")
+counts2 = dcast(counts2_long,GeneName~Basename,value.var="Count")
+gene_names = counts2$GeneName
+counts2[,GeneName:=NULL]
+counts2 = as.matrix(counts2)
+rownames(counts2) = gene_names
+
+counts2 = counts2[,colSums(counts2)>0]
+
+r_means = rowMeans(counts2)
+r_zeros = apply(counts2,1,FUN=function(x)sum(x>0))
+counts2 = counts2[r_means>30 & r_zeros>3*ncol(counts2)/4,]
+#show sample data
+}
+```
+
+```{r}
+if (0){
+annots_2 = annotations_2[Strain == "CA1200" & Auxin == 0,]
+counts2_t = counts2[!grepl("ERCC",rownames(counts2)),annots_2$Basename]
+nf = normalizationFactor(counts2_t)
+#daf2_effect_counts = sweep(daf2_effect_counts, 2, nf, "/")
+
+eft3_geneName = geneid[GeneSymbol=="eef-1A.1",GeneName]
+eif1_geneName = geneid[GeneSymbol=="eif-3.B",GeneName]
+daf2_geneName = geneid[GeneSymbol=="daf-2",GeneName]
+
+#daf2_effect_counts = counts[grepl(daf2_geneName,rownames(counts)),annots$Basename]
+
+
+TIR1_levels = data.frame(
+                         day = factor(annots_2$Day),
+                         TIR1=counts2_t[grepl("TIR",rownames(counts2_t)),],
+                      #   degron=daf2_effect_counts[grepl("degron",rownames(daf2_effect_counts)),],
+                        # `daf-2`=daf2_effect_counts[grepl(daf2_geneName,rownames(daf2_effect_counts)),],
+                         `eft_3`=counts2_t[grepl(eft3_geneName,rownames(counts2_t)),],
+                         `eif_3.B`=counts2_t[grepl(eif1_geneName,rownames(counts2_t)),],
+                         Basename=annots$Basename)
+
+dat = melt(TIR1_levels,id.vars=c("day","Basename"))
+names(dat)[names(dat)=="variable"] = "gene"
+ggplot(dat,aes(day,value,color=gene)) + geom_point() + ylab("Expression level") + xlab("Genotype")+ scale_y_continuous(trans="log10")+
+theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+#ggsave("TIR1_transgene_expression_levels.png")
+}
+```
+
+
+```{r}
+setwd(r"(z:\microscopy\sequence_data\202309_DC_JV_daf2degron)")
+annotations_d2 = fread("data/annotations/sample_annotations.csv")
+annotations_d2 = annotations_d2[Biological_replicate == 1,] #we don't analyze the second round of data here, involving single AID system components.  Those are analyzed in "Auxin_independent_effects.Rmd"
+annotations_d2$label = apply(annotations_d2,1,function(x)paste(ifelse(x[["Strain"]]=="QZ0","+;+",paste(x[["Promoter"]],"::TIR1(",x[["Tir1"]],");",x[["daf2AID"]],"xAID",sep="")),ifelse(x[["Auxin"]]=="FALSE",""," +AUXIN"),sep=""))
+
+fwrite(annotations_d2,"c:/tmp/annotations.csv")
+
+
+counts_long_d2=fread("data/annotated_counts/counts.csv.gz")
+fwrite(counts_long_d2,"c:/tmp/counts.csv.gz")
+counts_d2 = dcast(counts_long_d2,GeneName~Basename,value.var="Count")
+gene_names = counts_d2$GeneName
+counts_d2[,GeneName:=NULL]
+counts_d2 = as.matrix(counts_d2)
+rownames(counts_d2) = gene_names
+
+counts_d2 = counts_d2[,colSums(counts_d2)>0]
+
+#show sample data
+aggregate(Sample~Day+Tir1+Promoter+daf2AID+AuxinType+Auxin,annotations_d2,FUN=length)
+```
+
+```{r}
+annots = annotations_d2[((Promoter %in% c("eft3p","eif3Bp")  & Tir1=="WT") | Strain=="QZ0") & Auxin ==F & Basename %in% colnames(counts_d2),]
+daf2_effect_counts = counts_d2[!grepl("ERCC",rownames(counts_d2)),annots$Basename]
+nf = normalizationFactor(daf2_effect_counts)
+daf2_effect_counts = sweep(daf2_effect_counts, 2, nf, "/")
+
+eft3_geneName = geneid[GeneSymbol=="eef-1A.1",GeneName]
+eif1_geneName = geneid[GeneSymbol=="eif-3.B",GeneName]
+daf2_geneName = geneid[GeneSymbol=="daf-2",GeneName]
+tbb4_geneName = geneid[GeneSymbol=="tbb-4",GeneName]
+unc54_geneName = geneid[GeneSymbol=="unc-54",GeneName]
+
+                      
+
+#daf2_effect_counts = counts_d2[grepl(daf2_geneName,rownames(counts_d2)),annots$Basename]
+
+
+TIR1_levels = data.frame(promoter=annots$Promoter,
+                         daf2AID=as.character(annots$daf2AID),
+                         day = annots$Day,
+                         TIR1=daf2_effect_counts[grepl("TIR",rownames(daf2_effect_counts)),],
+                      #   degron=daf2_effect_counts[grepl("degron",rownames(daf2_effect_counts)),],
+                        # `daf-2`=daf2_effect_counts[grepl(daf2_geneName,rownames(daf2_effect_counts)),],
+                         `eft_3`=daf2_effect_counts[grepl(eft3_geneName,rownames(daf2_effect_counts)),],
+                         `eif_3.B`=daf2_effect_counts[grepl(eif1_geneName,rownames(daf2_effect_counts)),],
+                         `tbb-4`  =daf2_effect_counts[grepl(tbb4_geneName,rownames(daf2_effect_counts)),],
+                         `unc-54`  =daf2_effect_counts[grepl(unc54_geneName,rownames(daf2_effect_counts)),],
+                         Basename=annots$Basename)
+
+
+ggplot(TIR1_levels,aes(promoter,TIR1,color=factor(daf2AID))) + geom_point() + facet_wrap(~day)
+
+dat = data.table(melt(TIR1_levels,id.vars=c("promoter","day","Basename","daf2AID")))
+names(dat)[names(dat)=="variable"] = "gene"
+ggplot(dat,aes(ifelse(grepl("e",promoter),paste(promoter,"::TIR1",daf2AID),"wild type"),value,color=gene)) + geom_point() + facet_wrap(~day) + ylab("Expression level") + xlab("Genotype")+ scale_y_continuous(trans="log10")
+  
+dat2 = dat[ (promoter=="eft3p" & gene%in% c("TIR1","eft_3","unc.54")) | (promoter== "eif3Bp" & gene%in% c("TIR1","eif_3.B","tbb.4"))]
+dat2 = dat2[daf2AID<=1  ]
+dat2$pretty_promoter = dat2[,ifelse(grepl("e",promoter),paste(promoter,"::TIR1"),"wild type")]
+ggplot(dat2,aes(factor(day),value,color=gene)) + geom_point() + facet_wrap(~pretty_promoter) + ylab("Expression level") + xlab("Day")+ scale_y_continuous(trans="log10")+
+theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+ggsave("TIR1_transgene_expression_levels.png")
+```
+
+
+```{r}
+#load in phenotypic data
+library(survival)
+data = fread("lifespan_data.all_data_formatted.csv.gz")
+data_long = ns.survival.code::ns_convert_frequencies_into_repeats(raw_data=data[!is.na(Frequency),],frequency_column ="Frequency")
+data_long[,group_f :=factor(paste(concentration.uM,TIR1_variant,promoter,degron))]
+combos = unique(data_long[,.(concentration.uM,TIR1_variant,promoter,degron,group_f)])
+setkey(combos,group_f)
+sfit = survfit(Surv(data_long$Day,1-data_long$Censor)~data_long$group_f)
+
+group_fs = substring(names(sfit$strata),nchar("data_long$group_f=")+1)
+res = data.table(
+        mean=ns.survival.code::ns_survival_mean(sfit),
+        stderr=ns.survival.code::ns_survival_stderr(sfit),
+        concentration.uM=combos[group_fs,concentration.uM],
+        TIR1_variant=combos[group_fs,TIR1_variant],
+        promoter=combos[group_fs,promoter],
+          degron=combos[group_fs,degron])
+
+lifespan_data = res;
+lk = c("79F"="WT","F79G"="F79G","F79A"="F79A")
+lifespan_data[,Tir1:=lk[TIR1_variant]]
+lk = c("eft-3"="eft3p","eif-1"="eif3Bp")
+lifespan_data[,Promoter:=lk[promoter]]
+lk = c("1x"=1,"3x"=3)
+lifespan_data[,daf2AID:=lk[degron]]
+lifespan_data[,Auxin:=ifelse(concentration.uM%in% c(1.875,750,0),concentration.uM>0,NA)] #only the max concentrations were used for transcriptomics
+lifespan_data = lifespan_data[!is.na(Auxin)]
+lk = c("WT"="Aux","F79G"="5ph", "F79A"="5ad")
+lifespan_data[,AuxinType:=ifelse(!Auxin,"wo",lk[Tir1])]
+lifespan_data = lifespan_data[,.(mean,stderr,Tir1,Promoter,daf2AID,Auxin,AuxinType)]
+names(lifespan_data)[1:2] = c("lifespan.mean","lifespan.stderr")
+
+all_dauer = fread("all_dauer_merged.csv.gz")
+lk = c("79F"="WT","F79G"="F79G","F79A"="F79A")
+all_dauer[,Tir1:=lk[`tir-1`]]
+lk = c("eft-3p"="eft3p","eif-3p"="eif3Bp")
+all_dauer[,Promoter:=lk[promoter]]
+lk = c("1x"=1,"3x"=3)
+all_dauer[,daf2AID:=lk[`daf-2::AID`]]
+lk = c("KNAA"="Aux","5-ph-IAA"="5ph", "5-Ad-IAA"="5ad")
+all_dauer[,AuxinType:=ifelse(concentration.uM==0,"wo",lk[Compound])]
+dat_aggregate_1 = aggregate(Percent.Dauer~concentration.uM+Tir1+Promoter+daf2AID+AuxinType,all_dauer,FUN=mean)
+names(dat_aggregate_1)[6] = "mean"
+standard_error <- function(x) sd(x) / sqrt(length(x))
+dat_aggregate_2 =aggregate(Percent.Dauer~concentration.uM+Tir1+Promoter+daf2AID+AuxinType,all_dauer,FUN=standard_error)
+names(dat_aggregate_2)[6] = "stderr"
+dat_aggregate = data.table(merge(dat_aggregate_1,dat_aggregate_2,by=c("concentration.uM","Tir1","Promoter","daf2AID","AuxinType")))
+dat_aggregate[,mean := mean/100]
+dat_aggregate[,stderr := stderr/100]
+
+dauer_data = dat_aggregate
+
+max_concentrations = data.table(aggregate(concentration.uM~Promoter+Tir1+daf2AID+AuxinType,dauer_data,max))
+dauer_data$at_max_concentration = apply(dauer_data,1,function(x){max_concentrations[Promoter==x[["Promoter"]] & Tir1==x[["Tir1"]] & daf2AID==x[["daf2AID"]] & AuxinType==x[["AuxinType"]],"concentration.uM"]==as.numeric(x[["concentration.uM"]]); })
+dauer_data[,Auxin := AuxinType != "wo"]
+dauer_data = dauer_data[!Auxin | at_max_concentration,]
+dauer_data[,Auxin:=concentration.uM>0] #only the max concentrations were used for transcriptomics
+dauer_data = dauer_data[,.(mean,stderr,Tir1,Promoter,daf2AID,Auxin,AuxinType)]
+names(dauer_data)[1:2] = c("dauer.mean","dauer.stderr")
+
+
+dat = all_dauer
+dat[,group_f :=factor(paste(Tir1,Promoter,daf2AID))]
+combos = unique(dat[,.(Tir1,Promoter,daf2AID,group_f)])
+setkey(combos,group_f)
+dat[,frac_dauer:=`Percent.Dauer`/100]
+sigmoid_fits = lapply(levels(dat$group_f),function(g){
+  print(g)
+  d = dat[group_f==g,]
+ 
+  nls(frac_dauer~SSfpl(log10(concentration.uM), A=0, B=1, xmid, scal=s), data = d,start = c(xmid=median(log10(d$concentration.uM)),s=1))
+}
+)
+names(sigmoid_fits) = as.character(levels(dat$group_f))
+library(nlstools)
+
+
+dauer_p50 = rbindlist(lapply(names(sigmoid_fits),function(x){
+  ci=10^nlstools::confint2(sigmoid_fits[[x]],method="asymptotic")
+  data.frame(group_f=x,
+              xmid=10^coef(sigmoid_fits[[x]])["xmid"],
+              xmid.lci=ci[1,1],
+              xmid.uci=ci[1,2])
+}))
+dauer_p50$Tir1 = combos[dauer_p50$group_f,Tir1]
+dauer_p50$Promoter = combos[dauer_p50$group_f,Promoter]
+dauer_p50$daf2AID = as.integer(substring(combos[dauer_p50$group_f,daf2AID],1,1))
+
+
+phenotype_data = merge(lifespan_data,dauer_data,by=c("Tir1","Promoter","daf2AID","Auxin","AuxinType"),all.x=T,all.y=T)
+
+
+```
+
+
+```{r}
+if (0){
+#look for genes differentially regulated in the ON auxin condition
+annots = annotations_d2[Day == 1 & Auxin ==T ,]
+annots[,Tir1_type := ifelse(Promoter=="wo","none",paste(Promoter,Tir1))]
+annots[,Tir1_type_auxin := paste(Tir1_type,ifelse(Auxin,"+aux",""),daf2AID)]
+annots$Tir1_type_auxin_f = relevel(factor(annots$Tir1_type_auxin),ref="none +aux 0")
+daf2_effect_counts = counts_d2[!grepl("ERCC",rownames(counts_d2)),annots$Basename]
+r_means = rowMeans(daf2_effect_counts)
+r_zeros = apply(daf2_effect_counts,1,FUN=function(x)sum(x>0))
+counts_filtered = daf2_effect_counts[r_means>30 & r_zeros>3*ncol(daf2_effect_counts)/4,]
+#ERCC_counts = counts_d2[grepl("ERCC",rownames(counts_d2)),annots$Basename]
+nf = normalizationFactor(counts_filtered)
+#ercc_nf = normalizationFactor(ERCC_counts)
+
+#sfs = data.frame(sf = nf/ercc_nf, promoter=annots$Promoter)
+#ggplot(sfs,aes(promoter,sf))+geom_point()
+deseq_res = runDESeq(counts_filtered,annots,nf,~Tir1_type_auxin_f)
+deseq_res2 =  rbindlist(lapply(DESeq2::resultsNames(deseq_res)[-1], function(i) {
+    r <- DESeq2::results(deseq_res, name = i)
+    r <- as.data.table(r)
+    r <- r[, .(log2FoldChange, lfcSE, pvalue, padj)]
+    r[is.na(padj), padj := 1]
+    r$group = i
+    r[, GeneName := rownames(deseq_res)]
+    r
+  }))
+
+all_sig_changed_genes_on_Auxin = unique(deseq_res2[padj<.01,GeneName])
+occurance_table = table(deseq_res2[padj<.001,GeneName])
+all_sig_changed_genes_on_Auxin_in_most_conditions = names(occurance_table)[occurance_table>=6]
+
+deseq_res2[,Tir1_type :=substring(group,nchar("Tir1_type_f_")+1,nchar(group)-nchar("_vs_none"))]
+deseq_res2[,label:=ifelse(padj<.01,geneid[GeneName,GeneSymbol],"")]
+deseq_res2=deseq_res2[!grepl("TIR1",GeneName),]
+
+ggplot(deseq_res2,aes(log2FoldChange,-log10(padj),label=label,color=padj<.01))+geom_point()+geom_text_repel()+facet_wrap(~Tir1_type)
+
+genes_to_plot = c(
+eft3 = geneid[GeneSymbol=="eef-1A.1",GeneName],
+eif1 = geneid[GeneSymbol=="eif-3.B",GeneName],
+#daf2 = geneid[GeneSymbol=="daf-2",GeneName],
+tbb4 = geneid[GeneSymbol=="tbb-4",GeneName],
+unc54 = geneid[GeneSymbol=="unc-54",GeneName])
+deseq_res3 = deseq_res2[GeneName %in% genes_to_plot,]
+deseq_res3[,label:=geneid[GeneName,GeneSymbol]]
+ggplot(deseq_res3,aes(log2FoldChange,-log10(padj),label=label,color=padj<.01))+geom_point()+geom_text_repel()+facet_wrap(~Tir1_type)+geom_text_repel()+geom_abline(slope=1,intercept=0,color="gray")
+
+
+  
+  deseq_res_sub = deseq_res2[padj<.01 & abs(log2FoldChange) > 1,]
+  deseq_res_sub[,label:=geneid[GeneName,GeneSymbol]]
+  res = table(deseq_res_sub$label)
+  res = res[order(res,decreasing=T)]
+  res
+
+}
+```
+
+```{r}
+#look for genes differentially regulated in the absence of auxin
+annots = annotations_d2[ daf2AID<=1& Day == 1 & Auxin ==F ,]
+annots[,Tir1_type := ifelse(Promoter=="wo","none",paste(Promoter,Tir1))]
+annots[,Tir1_type_auxin := paste(Tir1_type,ifelse(Auxin,"+aux",""))]
+annots$Tir1_type_f = relevel(factor(annots$Tir1_type),ref="none")
+daf2_effect_counts = counts_d2[!grepl("ERCC",rownames(counts_d2)),annots$Basename]
+r_means = rowMeans(daf2_effect_counts)
+r_zeros = apply(daf2_effect_counts,1,FUN=function(x)sum(x>0))
+counts_filtered = daf2_effect_counts[r_means>30 & r_zeros>3*ncol(daf2_effect_counts)/4,]
+#ERCC_counts = counts_d2[grepl("ERCC",rownames(counts_d2)),annots$Basename]
+nf = normalizationFactor(counts_filtered)
+#ercc_nf = normalizationFactor(ERCC_counts)
+
+#sfs = data.frame(sf = nf/ercc_nf, promoter=annots$Promoter)
+#ggplot(sfs,aes(promoter,sf))+geom_point()
+deseq_res = runDESeq(counts_filtered,annots,nf,~Tir1_type_f)
+deseq_res2 =  rbindlist(lapply(DESeq2::resultsNames(deseq_res)[-1], function(i) {
+    r <- DESeq2::results(deseq_res, name = i)
+    r <- as.data.table(r)
+    r <- r[, .(log2FoldChange, lfcSE, pvalue, padj)]
+    r[is.na(padj), padj := 1]
+    r$group = i
+    r[, GeneName := rownames(deseq_res)]
+    r
+  }))
+
+all_sig_changed_genes = unique(deseq_res2[padj<=.01,GeneName])
+all_sig_changed_genes_counts = table(deseq_res2[padj<=.01,GeneName])
+common_sig_changed = names(all_sig_changed_genes_counts)[all_sig_changed_genes_counts>=3]
+setkey(geneid,GeneName)
+deseq_res2[,Tir1_type :=substring(group,nchar("Tir1_type_f_")+1,nchar(group)-nchar("_vs_none"))]
+deseq_res2[,label:=ifelse(padj<.01 & abs(log2FoldChange)>=1,geneid[GeneName,GeneSymbol],"")]
+deseq_res2=deseq_res2[!grepl("TIR1",GeneName),]
+library(ggrastr)
+if (0){ggplot(deseq_res2,aes(2^log2FoldChange,-log10(padj),label=label))+
+         geom_hline(yintercept=-log10(.01),lty=2,col="gray")+
+       geom_point_rast(size=.5,raster.dpi=600)+
+  geom_text_repel()+
+  facet_wrap(~Tir1_type)+xlab("Auxin-independent effect (Fold-change)")+scale_x_continuous(trans="log2")
+ggsave("figures/3/auxin_independent_genes_each_TIR1.pdf",height=10,width=10)
+}
+deseq_res2_sig = deseq_res2[GeneName %in% all_sig_changed_genes,]
+
+common_changes = deseq_res2[GeneName %in% all_sig_changed_genes,]
+comp_changes_log2 = dcast(common_changes,GeneName~Tir1_type,value.var="log2FoldChange")
+comp_changes_stderr = dcast(common_changes,GeneName~Tir1_type,value.var="lfcSE")
+comp_changes_merged = merge(comp_changes_log2,comp_changes_stderr,by="GeneName",suffixes=c(".log2",".stderr"))
+comp_changes_merged[,label:=geneid[GeneName,GeneSymbol]]
+
+compare_hits = function(dat,c1,c2,c1_label,c2_label){
+  c1.l=paste(c1,".log2",sep="")
+  c1.e=paste(c1,".stderr",sep="")
+  c2.l=paste(c2,".log2",sep="")
+  c2.e=paste(c2,".stderr",sep="")
+  dat$x=dat[,get(c1.l)]
+  dat$y=dat[,get(c2.l)]
+  dat$xmin=dat[,get(c1.l)+get(c1.e)]
+  dat$xmax=dat[,get(c1.l)-get(c1.e)]
+  dat$ymin=dat[,get(c2.l)+get(c2.e)]
+  dat$ymax=dat[,get(c2.l)-get(c2.e)]
+  
+  
+  correl = cor(dat$x,dat$y,method="p")
+rng = dat[,range(xmin,xmax,ymin,ymax)]
+ggplot(dat,aes(x=x,y=y,xmin=xmin,xmax=xmax,ymin=ymin,ymax=ymax,fill=GeneName,fill=GeneName,label=label))+
+  geom_text_repel(aes(color=GeneName))+
+  #geom_errorbar(color="black")+
+ # geom_errorbarh(color="black")+
+  geom_point(size=2,pch=21,color="black")+geom_abline(slope=1,intercept=0,lty=2,col="dark gray")+
+  geom_abline(slope=1,intercept=0,lty=2,col="dark gray")+
+  geom_hline(yintercept=0,lty=2,col="gray")+
+  geom_vline(xintercept=0,lty=2,col="gray")+
+  geom_smooth(method="lm",se=F,aes(fill=NULL,fill=NULL,label=NULL),color="black",lwd=1)+
+  xlim(rng)+ylim(rng)+
+  theme(legend.position="none")+xlab(paste("Auxin-independent effect in\n",c1_label, " (fold-change)",sep=""))+
+                                       ylab(paste("Auxin-independent effect in\n",c2_label, " (fold-change)",sep=""))+
+   annotate(geom="text", x=quantile(dat$x,.01), y=quantile(dat$y,.99), label=paste("rho=",round(correl,3)),
+              color="black") 
+}
+ggpubr::ggarrange(compare_hits(comp_changes_merged,"eft3p.WT","eft3p.F79G","79F","F79G"),
+compare_hits(comp_changes_merged,"eft3p.WT","eft3p.F79A","79F","F79A"),
+compare_hits(comp_changes_merged,"eft3p.F79G","eft3p.F79A","F79G","F79A"),ncol=3)
+ggsave("figures/3/auxin_independent_TIR1_genes.pdf",height=5,width=15)
+fwrite(common_changes,"tables/auxin_independent_TIR1_genes.csv.gz")
+
+compare_hits(comp_changes_merged,"eft3p.WT","eft3p.F79A","79F","F79A")
+
+wide = dcast(common_changes,GeneName~Tir1_type,value.var = "log2FoldChange")
+wide$GeneSymbol = geneid[wide$GeneName,GeneSymbol]
+fwrite(wide,"tables/auxin_independent_TIR1_genes_wide.csv")
+
+genes_to_plot = c(
+eft3 = geneid[GeneSymbol=="eef-1A.1",GeneName],
+eif1 = geneid[GeneSymbol=="eif-3.B",GeneName],
+#daf2 = geneid[GeneSymbol=="daf-2",GeneName],
+tbb4 = geneid[GeneSymbol=="tbb-4",GeneName],
+unc54 = geneid[GeneSymbol=="unc-54",GeneName])
+deseq_res3 = deseq_res2[GeneName %in% genes_to_plot,]
+deseq_res3[,label:=geneid[GeneName,GeneSymbol]]
+ggplot(deseq_res3,aes(log2FoldChange,-log10(padj),label=label,color=padj<.01))+geom_point()+geom_text_repel()+facet_wrap(~Tir1_type)+geom_text_repel()+geom_abline(slope=1,intercept=0,color="gray")
+
+
+  
+  deseq_res_sub = deseq_res2[padj<.01 & abs(log2FoldChange) > 1,]
+  deseq_res_sub[,label:=geneid[GeneName,GeneSymbol]]
+  res = table(deseq_res_sub$label)
+  res = res[order(res,decreasing=T)]
+  res
+
+
+```
+
+
+```{r}
+#look for genes differentially regulated in the absence of auxin:
+#cluster RNA's based on raw correlation and make nice dendogram heatmap
+	library(dendextend)
+library(ComplexHeatmap)
+	recalc_corr=T
+	if (recalc_corr){
+	  
+	  fc_sig_ts_df = data.table(dcast(deseq_res2_sig,GeneName~Tir1_type,value.var="log2FoldChange"))
+	  fc_sig_ts = fc_sig_ts_df;
+	  fc_sig_ts[,GeneName:=NULL]
+	  fc_sig_ts = as.matrix(fc_sig_ts);
+	  rownames(fc_sig_ts) = fc_sig_ts_df$GeneName
+		corr_m = matrix(NA,nrow=dim(fc_sig_ts)[2],ncol=dim(fc_sig_ts)[2])
+		rownames(corr_m) = colnames(corr_m) = colnames(fc_sig_ts)
+		for (i in 1:dim(fc_sig_ts)[2]){
+			for (j in 1:dim(fc_sig_ts)[2]){
+				corr_m[i,j] = cor(fc_sig_ts[,i],fc_sig_ts[,j], method = "s")
+			}
+		}
+	}
+	if (recalc_corr){
+	 				corr_r = t(cor(t(fc_sig_ts), method = "p"))
+	}
+	#colfunc <- colorRampPalette(c("blue", "white","red"))
+	#rampbreaks <- seq(-1, 1, length.out = 512+1)
+
+
+	clustered_dat =hclust(as.dist(1-corr_m), method = "complete")
+	TIR1_dendogram = as.dendrogram(clustered_dat)
+	
+	clustered_dat =hclust(as.dist(1-corr_r), method = "ward.D2")
+	gene_dendogram = as.dendrogram(clustered_dat)
+  gene_order = clustered_dat$order
+	
+	gp = Heatmap(fc_sig_ts,
+	             #cluster_rows=gene_dendogram,
+	             cluster_columns=TIR1_dendogram,
+	            # row_order=gene_order,
+	             row_labels =rep("",nrow(fc_sig_ts)))
+  plot(gp)
+  pdf("auxin-independent_basal_dendogram.pdf",width=10,height=10)
+  plot(gp)
+  dev.off()
+```
+```{r}
+#look for genes differentially regulated BY COMPOUNDS
+#previously there was not a Genotype== "N2" flag, leading to an error in the previous main text panels c-d.
+annots = annotations_d2[ daf2AID==0& Day == 1 & Genotype == "N2",]
+lk = c("5ph"="5-Ph-IAA","wo"="none","5ad"="5-Ad-IAA","Aux"="KNAA")
+annots[,Tir1_type := lk[AuxinType]]
+annots$Tir1_type_f = relevel(factor(annots$Tir1_type),ref="none")
+daf2_effect_counts = counts_d2[!grepl("ERCC",rownames(counts_d2)),annots$Basename]
+r_means = rowMeans(daf2_effect_counts)
+r_zeros = apply(daf2_effect_counts,1,FUN=function(x)sum(x>0))
+counts_filtered = daf2_effect_counts[r_means>30 & r_zeros>3*ncol(daf2_effect_counts)/4,]
+#ERCC_counts = counts_d2[grepl("ERCC",rownames(counts_d2)),annots$Basename]
+nf = normalizationFactor(counts_filtered)
+#ercc_nf = normalizationFactor(ERCC_counts)
+
+#sfs = data.frame(sf = nf/ercc_nf, promoter=annots$Promoter)
+#ggplot(sfs,aes(promoter,sf))+geom_point()
+deseq_res = runDESeq(counts_filtered,annots,nf,~Tir1_type_f)
+deseq_res2 =  rbindlist(lapply(DESeq2::resultsNames(deseq_res)[-1], function(i) {
+    r <- DESeq2::results(deseq_res, name = i)
+    r <- as.data.table(r)
+    r <- r[, .(log2FoldChange, lfcSE, pvalue, padj)]
+    r[is.na(padj), padj := 1]
+    r$group = i
+    r[, GeneName := rownames(deseq_res)]
+    r
+  }))
+
+all_sig_changed_genes = unique(deseq_res2[padj<=.01,GeneName])
+all_sig_changed_genes_counts = table(deseq_res2[padj<=.01,GeneName])
+common_sig_changed = names(all_sig_changed_genes_counts)[all_sig_changed_genes_counts>=3]
+deseq_res2[,Tir1_type :=substring(group,nchar("Tir1_type_f_")+1,nchar(group)-nchar("_vs_none"))]
+setkey(geneid,GeneName)
+deseq_res2[,label:=ifelse(padj<.01 & abs(log2FoldChange)>=1,geneid[GeneName,GeneSymbol],"")]
+deseq_res2=deseq_res2[!grepl("TIR1",GeneName),]
+library(ggrastr)
+ggplot(deseq_res2,aes(2^log2FoldChange,-log10(padj),label=label))+
+         geom_hline(yintercept=-log10(.01),lty=2,col="gray")+
+       geom_point_rast(size=.5,raster.dpi=600)+
+  geom_text_repel()+
+  facet_wrap(~Tir1_type)+xlab("Compound effect (Fold-change)")+scale_x_continuous(trans="log2")
+ggsave("figures/3/compound_effect_genes.pdf",height=10,width=10)
+fwrite(deseq_res2[padj<=.01,],"tables/compound_effect_genes.csv.gz")
+          
+deseq_res2_sig = deseq_res2[GeneName %in% all_sig_changed_genes,]
+
+common_changes = deseq_res2[GeneName %in% all_sig_changed_genes,]
+comp_changes_log2 = dcast(common_changes,GeneName~Tir1_type,value.var="log2FoldChange")
+comp_changes_stderr = dcast(common_changes,GeneName~Tir1_type,value.var="lfcSE")
+comp_changes_merged = merge(comp_changes_log2,comp_changes_stderr,by="GeneName",suffixes=c(".log2",".stderr"))
+comp_changes_merged[,label:=geneid[GeneName,GeneSymbol]]
+
+compare_hits = function(dat,c1,c2,c1_label,c2_label){
+  c1.l=paste(c1,".log2",sep="")
+  c1.e=paste(c1,".stderr",sep="")
+  c2.l=paste(c2,".log2",sep="")
+  c2.e=paste(c2,".stderr",sep="")
+  dat$x=dat[,get(c1.l)]
+  dat$y=dat[,get(c2.l)]
+  dat$xmin=dat[,get(c1.l)+get(c1.e)]
+  dat$xmax=dat[,get(c1.l)-get(c1.e)]
+  dat$ymin=dat[,get(c2.l)+get(c2.e)]
+  dat$ymax=dat[,get(c2.l)-get(c2.e)]
+rng = dat[,range(xmin,xmax,ymin,ymax)]
+correl = cor(dat$x,dat$y,method="p")
+ggplot(dat,aes(x=x,y=y,xmin=xmin,xmax=xmax,ymin=ymin,ymax=ymax,fill=GeneName,fill=GeneName,label=label))+
+  geom_text_repel(aes(color=GeneName))+
+ # geom_errorbar(color="black")+
+ # geom_errorbarh(color="black")+
+  geom_point(size=2,pch=21,color="black")+geom_abline(slope=1,intercept=0,lty=2,col="dark gray")+
+  geom_abline(slope=1,intercept=0,lty=2,col="dark gray")+
+  geom_hline(yintercept=0,lty=2,col="gray")+
+  geom_vline(xintercept=0,lty=2,col="gray")+
+  geom_smooth(method="lm",se=F,aes(fill=NULL,fill=NULL,label=NULL),color="black",lwd=1)+
+  xlim(rng)+ylim(rng)+
+  theme(legend.position="none")+xlab(paste(c1_label, " effect\n(log2 fold-change)",sep=""))+
+                                       ylab(paste(c2_label, " effect\n(log2 fold-change)",sep=""))+  
+  annotate(geom="text", x=quantile(dat$x,.01), y=quantile(dat$y,.99), label=paste("rho=",round(correl,3)),
+              color="black") 
+}
+
+ggpubr::ggarrange(compare_hits(comp_changes_merged,"KNAA","5.Ph.IAA","KNAA","5.Ph.IAA"),
+compare_hits(comp_changes_merged,"KNAA","5.Ad.IAA","KNAA","5.Ad.IAA"),
+compare_hits(comp_changes_merged,"5.Ph.IAA","5.Ad.IAA","5.Ph.IAA","5.Ad.IAA"),ncol=3)
+ggsave("figures/3/compound_effect_genes_comparing_TIR1.pdf",height=5,width=15)
+
+
+genes_to_plot = c(
+eft3 = geneid[GeneSymbol=="eef-1A.1",GeneName],
+eif1 = geneid[GeneSymbol=="eif-3.B",GeneName],
+#daf2 = geneid[GeneSymbol=="daf-2",GeneName],
+tbb4 = geneid[GeneSymbol=="tbb-4",GeneName],
+unc54 = geneid[GeneSymbol=="unc-54",GeneName])
+deseq_res3 = deseq_res2[GeneName %in% genes_to_plot,]
+deseq_res3[,label:=geneid[GeneName,GeneSymbol]]
+ggplot(deseq_res3,aes(log2FoldChange,-log10(padj),label=label,color=padj<.01))+geom_point()+geom_text_repel()+facet_wrap(~Tir1_type)+geom_text_repel()+geom_abline(slope=1,intercept=0,color="gray")
+
+
+  
+  deseq_res_sub = deseq_res2[padj<.01 & abs(log2FoldChange) > 1,]
+  deseq_res_sub[,label:=geneid[GeneName,GeneSymbol]]
+  res = table(deseq_res_sub$label)
+  res = res[order(res,decreasing=T)]
+  res
+
+
+```
+
+
+
+```{r}
+#look for genes differentially regulated across all conditions
+annots = annotations_d2[ Day == 1 ,]
+annots[,Tir1_type := paste0(ifelse(Promoter=="wo","none",paste0(Promoter,"::",Tir1,";",daf2AID,"xAID")),ifelse(Auxin,paste0(".",AuxinType),""))]
+
+annots$Tir1_type_f = relevel(factor(annots$Tir1_type),ref="none")
+daf2_effect_counts = counts_d2[grepl("WB",rownames(counts_d2)),annots$Basename]
+r_means = rowMeans(daf2_effect_counts)
+r_zeros = apply(daf2_effect_counts,1,FUN=function(x)sum(x>0))
+counts_filtered = daf2_effect_counts[r_means>30 & r_zeros>3*ncol(daf2_effect_counts)/4,]
+#ERCC_counts = counts_d2[grepl("ERCC",rownames(counts_d2)),annots$Basename]
+nf = normalizationFactor(counts_filtered)
+#ercc_nf = normalizationFactor(ERCC_counts)
+
+#sfs = data.frame(sf = nf/ercc_nf, promoter=annots$Promoter)
+#ggplot(sfs,aes(promoter,sf))+geom_point()
+deseq_res = runDESeq(counts_filtered,annots,nf,~Tir1_type_f)
+deseq_res2 =  rbindlist(lapply(DESeq2::resultsNames(deseq_res)[-1], function(i) {
+    r <- DESeq2::results(deseq_res, name = i)
+    r <- as.data.table(r)
+    r <- r[, .(log2FoldChange, lfcSE, pvalue, padj)]
+    r[is.na(padj), padj := 1]
+    r$group = i
+    r[, GeneName := rownames(deseq_res)]
+    r
+  }))
+
+all_sig_changed_genes = unique(deseq_res2[padj<=.01,GeneName])
+all_sig_changed_genes_counts = table(deseq_res2[padj<=.01,GeneName])
+common_sig_changed = names(all_sig_changed_genes_counts)[all_sig_changed_genes_counts>=3]
+deseq_res2[,Tir1_type :=substring(group,nchar("Tir1_type_f_")+1,nchar(group)-nchar("_vs_none"))]
+deseq_res2[,label:=ifelse(padj<.01 & abs(log2FoldChange)>=1,geneid[GeneName,GeneSymbol],"")]
+deseq_res2=deseq_res2[!grepl("TIR1",GeneName),]
+deseq_res2_sig = deseq_res2[GeneName %in% all_sig_changed_genes,]
+
+```
+
+
+```{r}
+#look for genes differentially regulated in the presence of auxin:
+#cluster RNA's based on raw correlation and make nice dendogram heatmap
+	library(dendextend)
+library(ComplexHeatmap)
+	recalc_corr=T
+	if (recalc_corr){
+	  
+	  fc_sig_ts_df = data.table(dcast(deseq_res2_sig,GeneName~Tir1_type,value.var="log2FoldChange"))
+	  fc_sig_ts = fc_sig_ts_df;
+	  fc_sig_ts[,GeneName:=NULL]
+	  fc_sig_ts = as.matrix(fc_sig_ts);
+	  rownames(fc_sig_ts) = fc_sig_ts_df$GeneName
+		corr_m = matrix(NA,nrow=dim(fc_sig_ts)[2],ncol=dim(fc_sig_ts)[2])
+		rownames(corr_m) = colnames(corr_m) = colnames(fc_sig_ts)
+		for (i in 1:dim(fc_sig_ts)[2]){
+			for (j in 1:dim(fc_sig_ts)[2]){
+				corr_m[i,j] = cor(fc_sig_ts[,i],fc_sig_ts[,j], method = "s")
+			}
+		}
+	}
+	if (recalc_corr){
+	 				corr_r = t(cor(t(fc_sig_ts), method = "p"))
+	}
+	#colfunc <- colorRampPalette(c("blue", "white","red"))
+	#rampbreaks <- seq(-1, 1, length.out = 512+1)
+
+
+	clustered_dat =hclust(as.dist(1-corr_m), method = "complete")
+	TIR1_dendogram = as.dendrogram(clustered_dat)
+	
+	clustered_dat =hclust(as.dist(1-corr_r), method = "ward.D2")
+	gene_dendogram = as.dendrogram(clustered_dat)
+  gene_order = clustered_dat$order
+	
+	gp = Heatmap(fc_sig_ts,
+	             #cluster_rows=gene_dendogram,
+	             cluster_columns=TIR1_dendogram,
+	            # row_order=gene_order,
+	             row_labels =rep("",nrow(fc_sig_ts)))
+  plot(gp)
+  pdf("all_condition_dendogram.pdf",width=10,height=10)
+  plot(gp)
+  dev.off()
+  corr_m2 = corr_m
+  diag(corr_m2) = NA
+  	gp = Heatmap(corr_m2,
+	             cluster_rows=TIR1_dendogram,
+	             cluster_columns=TIR1_dendogram, 
+	             cell_fun = function(j, i, x, y, width, height, fill) {
+               grid.text(if(!is.na(corr_m2[i,j]))sprintf("%.1f", corr_m2[i, j]), x, y, gp = gpar(fontsize = 12))})
+  	
+  	
+```
+
+```{r}
+#look for genes differentially regulated in the presence of auxin
+#WRONG WAY TO DO IT, POOLING ALL COMPOUNDS TOGETHER IN THE COTROLS
+if(0){
+annots = annotations_d2[ Day == 1 & daf2AID==1&Auxin ==T ,]
+annots[,Tir1_type := ifelse(Promoter=="wo","none",paste(Promoter,"::",Tir1,";",daf2AID,"xAID",sep=""))]
+annots[,Tir1_type_auxin := paste(Tir1_type,ifelse(Auxin,"+aux",""))]
+annots$Tir1_type_f = relevel(factor(annots$Tir1_type),ref="none")
+daf2_effect_counts = counts_d2[grepl("WB",rownames(counts_d2)),annots$Basename]
+r_means = rowMeans(daf2_effect_counts)
+r_zeros = apply(daf2_effect_counts,1,FUN=function(x)sum(x>0))
+counts_filtered = daf2_effect_counts[r_means>30 & r_zeros>3*ncol(daf2_effect_counts)/4,]
+#ERCC_counts = counts_d2[grepl("ERCC",rownames(counts_d2)),annots$Basename]
+nf = normalizationFactor(counts_filtered)
+#ercc_nf = normalizationFactor(ERCC_counts)
+
+#sfs = data.frame(sf = nf/ercc_nf, promoter=annots$Promoter)
+#ggplot(sfs,aes(promoter,sf))+geom_point()
+deseq_res = runDESeq(counts_filtered,annots,nf,~Tir1_type_f)
+deseq_res2 =  rbindlist(lapply(DESeq2::resultsNames(deseq_res)[-1], function(i) {
+    r <- DESeq2::results(deseq_res, name = i)
+    r <- as.data.table(r)
+    r <- r[, .(log2FoldChange, lfcSE, pvalue, padj)]
+    r[is.na(padj), padj := 1]
+    r$group = i
+    r[, GeneName := rownames(deseq_res)]
+    r
+  }))
+
+all_sig_changed_genes = unique(deseq_res2[padj<=.01,GeneName])
+all_sig_changed_genes_counts = table(deseq_res2[padj<=.01,GeneName])
+common_sig_changed = names(all_sig_changed_genes_counts)[all_sig_changed_genes_counts>=3]
+deseq_res2[,Tir1_type :=substring(group,nchar("Tir1_type_f_")+1,nchar(group)-nchar("_vs_none"))]
+deseq_res2[,label:=ifelse(padj<.01 & abs(log2FoldChange)>=1,geneid[GeneName,GeneSymbol],"")]
+deseq_res2=deseq_res2[!grepl("TIR1",GeneName),]
+library(ggrastr)
+if(0){
+  ggplot(deseq_res2,aes(2^log2FoldChange,-log10(padj),label=label))+
+           geom_hline(yintercept=-log10(.01),lty=2,col="gray")+
+         geom_point_rast(size=.5,raster.dpi=600)+
+    geom_text_repel()+
+    facet_wrap(~Tir1_type,ncol=4)+xlab("Auxin-dependent effect (Fold-change)")+scale_x_continuous(trans="log2")
+  ggsave("figures/3/auxin_dependent_genes_each_TIR1.pdf",height=5,width=10)
+       
+deseq_res2_sig = deseq_res2[GeneName %in% all_sig_changed_genes,]
+fwrite(deseq_res2_sig,"tables/auxin_dependent_effects.csv.gz")
+}
+common_changes = deseq_res2[GeneName %in% common_sig_changed,]
+comp_changes_log2 = dcast(common_changes,GeneName~Tir1_type,value.var="log2FoldChange")
+comp_changes_stderr = dcast(common_changes,GeneName~Tir1_type,value.var="lfcSE")
+comp_changes_merged = merge(comp_changes_log2,comp_changes_stderr,by="GeneName",suffixes=c(".log2",".stderr"))
+comp_changes_merged[,label:=geneid[GeneName,GeneSymbol]]
+
+compare_hits = function(dat,c1,c2,c1_label,c2_label,fit=T){
+  c1.l=paste(c1,".log2",sep="")
+  c1.e=paste(c1,".stderr",sep="")
+  c2.l=paste(c2,".log2",sep="")
+  c2.e=paste(c2,".stderr",sep="")
+  dat$x=dat[,get(c1.l)]
+  dat$y=dat[,get(c2.l)]
+  dat$xmin=dat[,get(c1.l)+get(c1.e)]
+  dat$xmax=dat[,get(c1.l)-get(c1.e)]
+  dat$ymin=dat[,get(c2.l)+get(c2.e)]
+  dat$ymax=dat[,get(c2.l)-get(c2.e)]
+  correl = cor(dat$x,dat$y,method="p",use="complete.obs")
+rng = dat[,range(xmin,xmax,ymin,ymax)]
+ggplot(dat,aes(x=x,y=y,xmin=xmin,xmax=xmax,ymin=ymin,ymax=ymax,fill=GeneName,fill=GeneName,label=label))+
+  geom_text_repel(aes(color=GeneName))+
+  #geom_errorbar(color="black")+
+ # geom_errorbarh(color="black")+
+  geom_point_rast(size=2,pch=21,color="black")+geom_abline(slope=1,intercept=0,lty=2,col="dark gray",raster.dpi=600)+
+  geom_abline(slope=1,intercept=0,lty=2,col="dark gray")+
+  
+  geom_smooth(aes(fill=NULL,fill=NULL,label=NULL),method="lm",se=F,lwd=1,col="black")+
+  geom_hline(yintercept=0,lty=2,col="gray")+
+  geom_vline(xintercept=0,lty=2,col="gray")+
+  xlim(rng)+ylim(rng)+
+  theme(legend.position="none")+xlab(paste("Auxin-dependent effect\n",c1_label, " (log2 fold-change)",sep=""))+
+                                       ylab(paste("Auxin-dependent effect in\n",c2_label, " (log2 fold-change)",sep=""))+
+  annotate(geom="text", x=quantile(dat$x,.991,na.rm=T), y=quantile(dat$y,.01,na.rm=T), label=paste("rho=",round(correl,3)),
+              color="black") 
+}
+
+if (0){
+ggpubr::ggarrange(compare_hits(comp_changes_merged,"eft3p..WT.1xAID","eft3p..WT.3xAID","eft-3p::79F; 1xAID","eft-3p::79F; 3xAID"),
+compare_hits(comp_changes_merged,"eft3p..WT.1xAID","eif3Bp..WT.1xAID","eft-3p::79F; 1xAID","eif-3Bp::79F; 1xAID"),
+compare_hits(comp_changes_merged,"eft3p..WT.1xAID","eft3p..F79G.1xAID","eft-3p::79F; 1xAID","eft-3p::F79G; 1xAID"),
+compare_hits(comp_changes_merged,"eft3p..WT.1xAID","eft3p..F79A.1xAID","eft-3p::79F; 1xAID","eft-3p::F79A; 1xAID"),ncol=4,nrow=1)
+ggsave("figures/3/auxin_dependent_genes_comparing_TIR1.pdf",height=5,width=20)
+}
+ggpubr::ggarrange(
+compare_hits(comp_changes_merged,"eft3p..WT.1xAID..Aux","eft3p..F79G.1xAID..5ph","eft-3p::79F; 1xAID","eft-3p::F79G; 1xAID"),
+compare_hits(comp_changes_merged,"eft3p..WT.1xAID..Aux","eft3p..F79A.1xAID..5ad","eft-3p::79F; 1xAID","eft-3p::F79A; 1xAID"),
+compare_hits(comp_changes_merged,"eft3p..F79G.1xAID..5ph","eft3p..F79A.1xAID..5ad","eft-3p::F79G; 1xAID","eft-3p::F79A; 1xAID"),
+compare_hits(comp_changes_merged,"eft3p..WT.1xAID..Aux","eif3Bp..WT.1xAID..Aux","eft-3p::79F; 1xAID","eif-3Bp::79F; 1xAID"),
+            compare_hits(comp_changes_merged,"eif3Bp..WT.1xAID..Aux","eif3Bp..WT.3xAID..Aux","eif-3Bp::79F; 1xAID","eif-3Bp::79F; 3xAID"),ncol=5,nrow=1)
+ggsave("figures/3/auxin_dependent_genes_comparing_TIR1.pdf",height=5,width=25)
+
+
+genes_to_plot = c(
+eft3 = geneid[GeneSymbol=="eef-1A.1",GeneName],
+eif1 = geneid[GeneSymbol=="eif-3.B",GeneName],
+#daf2 = geneid[GeneSymbol=="daf-2",GeneName],
+tbb4 = geneid[GeneSymbol=="tbb-4",GeneName],
+unc54 = geneid[GeneSymbol=="unc-54",GeneName])
+deseq_res3 = deseq_res2[GeneName %in% genes_to_plot,]
+deseq_res3[,label:=geneid[GeneName,GeneSymbol]]
+ggplot(deseq_res3,aes(log2FoldChange,-log10(padj),label=label,color=padj<.01))+geom_point()+geom_text_repel()+facet_wrap(~Tir1_type)+geom_text_repel()+geom_abline(slope=1,intercept=0,color="gray")
+
+
+  
+  deseq_res_sub = deseq_res2[padj<.01 & abs(log2FoldChange) > 1,]
+  deseq_res_sub[,label:=geneid[GeneName,GeneSymbol]]
+  res = table(deseq_res_sub$label)
+  res = res[order(res,decreasing=T)]
+  res
+}
+
+```
+
+```{r}
+#look for genes differentially regulated in the presence of auxin
+#BETTER BUT NOT PERFECT WAY TO DO IT, SEPARATING CONTROLS
+
+#Note: This approach integrates both the effect of the degron and the effect of the compound (they are not modelled separately)
+#which produces a result in contrast with an alternate approach explored in auxin_independent_effects.Rmd which accounts for both" (do a text search for "redux")
+auxin_types = unique(annotations_d2$AuxinType)
+ref="wo"
+auxin_types = auxin_types[auxin_types!=ref]
+deseq_res2 = rbindlist(lapply(unique(annotations_d2$AuxinType),function(aux_type){
+  annots_all = annotations_d2[ Day == 1 & daf2AID>=1 & Auxin == T & AuxinType==aux_type,]
+  strains = unique(annots_all$Strain)
+  rbindlist(lapply(strains,function(strain){
+    print(paste(aux_type,strain))
+    annots = rbind(annots_all[Strain==strain,],
+                   annotations_d2[ Day == 1 & daf2AID>=1 & Auxin ==F &AuxinType==ref & Strain == strain,])
+    annots[,Tir1_type := ifelse(Promoter=="wo","none",paste(Promoter,"::",Tir1,";",daf2AID,"xAID",sep=""))]
+    annots[,Tir1_type_auxin := paste(Tir1_type,ifelse(Auxin,paste0("+",AuxinType),""))]
+    annots$Tir1_type_f = relevel(factor(annots$Tir1_type_auxin),ref=unique(annots[Auxin==F,Tir1_type_auxin]))
+    print(annots)
+    daf2_effect_counts = counts_d2[grepl("WB",rownames(counts_d2)),annots$Basename]
+    r_means = rowMeans(daf2_effect_counts)
+    r_zeros = apply(daf2_effect_counts,1,FUN=function(x)sum(x>0))
+    counts_filtered = daf2_effect_counts[r_means>30 & r_zeros>3*ncol(daf2_effect_counts)/4,]
+    #ERCC_counts = counts_d2[grepl("ERCC",rownames(counts_d2)),annots$Basename]
+    nf = normalizationFactor(counts_filtered)
+    #ercc_nf = normalizationFactor(ERCC_counts)
+    
+    #sfs = data.frame(sf = nf/ercc_nf, promoter=annots$Promoter)
+    #ggplot(sfs,aes(promoter,sf))+geom_point()
+    deseq_res = runDESeq(counts_filtered,annots,nf,~Tir1_type_f)
+    deseq_res2 =  rbindlist(lapply(DESeq2::resultsNames(deseq_res)[-1], function(i) {
+        r <- DESeq2::results(deseq_res, name = i)
+        r <- as.data.table(r)
+        r <- r[, .(log2FoldChange, lfcSE, pvalue, padj)]
+        r[is.na(padj), padj := 1]
+        r$group = i
+        r[, GeneName := rownames(deseq_res)]
+        r
+      }))
+    deseq_res2
+    }))
+}))
+
+all_sig_changed_genes = unique(deseq_res2[padj<=.01,GeneName])
+all_sig_changed_genes_counts = table(deseq_res2[padj<=.01,GeneName])
+
+all_sig_changed_genes_on_Auxin_in_most_conditions = names(all_sig_changed_genes_counts)[all_sig_changed_genes_counts>=6]
+
+common_sig_changed = names(all_sig_changed_genes_counts)[all_sig_changed_genes_counts>=3]
+deseq_res2[,Tir1_type :=substring(group,nchar("Tir1_type_f_")+1,lapply(gregexpr("_vs",group),function(x)x[1]-1))]
+deseq_res2[,label:=ifelse(padj<.01 & abs(log2FoldChange)>=1,geneid[GeneName,GeneSymbol],"")]
+deseq_res2=deseq_res2[!grepl("TIR1",GeneName),]
+library(ggrastr)
+if (0){
+  ggplot(deseq_res2,aes(2^log2FoldChange,-log10(padj),label=label))+
+           geom_hline(yintercept=-log10(.01),lty=2,col="gray")+
+         geom_point_rast(size=.5,raster.dpi=600)+
+    geom_text_repel()+
+    facet_wrap(~Tir1_type,ncol=4)+xlab("Auxin-dependent effect (Fold-change)")+scale_x_continuous(trans="log2")
+  ggsave("figures/3/auxin_dependent_genes_each_TIR1.pdf",height=5,width=10)
+}         
+#deseq_res2_sig = deseq_res2[GeneName %in% all_sig_changed_genes,]
+fwrite(deseq_res2,"tables/Supplementary table - activated TIR1;daf-2 effects.csv.gz")
+
+common_changes = deseq_res2[GeneName %in% common_sig_changed,]
+comp_changes_log2 = dcast(common_changes,GeneName~Tir1_type,value.var="log2FoldChange")
+comp_changes_stderr = dcast(common_changes,GeneName~Tir1_type,value.var="lfcSE")
+comp_changes_padj = dcast(common_changes,GeneName~Tir1_type,value.var="padj")
+names(comp_changes_padj)[names(comp_changes_padj)!="GeneName"] = paste0(names(comp_changes_padj)[names(comp_changes_padj)!="GeneName"],".padj")
+comp_changes_merged = merge(merge(comp_changes_log2,comp_changes_stderr,by="GeneName",suffixes=c(".log2",".stderr")),comp_changes_padj,by="GeneName")
+comp_changes_merged[,label:=geneid[GeneName,GeneSymbol]]
+
+compare_hits = function(dat,c1,c2,c1_label,c2_label,fit=T){
+  c1.l=paste(c1,".log2",sep="")
+  c1.e=paste(c1,".stderr",sep="")
+  c1.p=paste(c1,".padj",sep="")
+  c2.l=paste(c2,".log2",sep="")
+  c2.e=paste(c2,".stderr",sep="")
+  c2.p=paste(c2,".padj",sep="")
+  dat$x=dat[,get(c1.l)]
+  dat$y=dat[,get(c2.l)]
+  dat$xmin=dat[,get(c1.l)+get(c1.e)]
+  dat$xmax=dat[,get(c1.l)-get(c1.e)]
+  dat$ymin=dat[,get(c2.l)+get(c2.e)]
+  dat$ymax=dat[,get(c2.l)-get(c2.e)]
+  dat[,sig:=abs(get(c1.l))>=1 & get(c1.p) < .01 | abs(get(c2.l))>=1 & get(c2.p) < .01 ];
+  dat[sig==F,label:=""]
+  correl = cor(dat[sig==T,]$x,dat[sig==T,]$y,method="p",use="complete.obs")
+  
+rng = dat[,range(xmin,xmax,ymin,ymax,na.rm=T)]
+print(rng)
+ggplot(dat,aes(x=x,y=y,fill=GeneName,label=label))+
+  geom_text_repel(aes(color=GeneName))+
+  #geom_errorbar(color="black")+
+ # geom_errorbarh(color="black")+
+  geom_point_rast(data=dat[sig==F,],size=2,pch=21,color="black",raster.dpi=600,fill="black",alpha=.3)+
+  geom_point_rast(data=dat[sig==T,],size=2,pch=21,color="black",raster.dpi=600,alpha=.7)+
+  geom_abline(slope=1,intercept=0,lty=2,col="dark gray",alpha=.7)+
+  geom_abline(slope=1,intercept=0,lty=2,col="dark gray")+
+  
+  geom_smooth(aes(fill=NULL,fill=NULL,label=NULL),method="lm",se=F,lwd=1,col="black")+
+  geom_hline(yintercept=0,lty=2,col="gray")+
+  geom_vline(xintercept=0,lty=2,col="gray")+
+  xlim(rng)+ylim(rng)+
+  theme(legend.position="none")+xlab(paste("Auxin-dependent effect\n",c1_label, " (log2 fold-change)",sep=""))+
+                                       ylab(paste("Auxin-dependent effect in\n",c2_label, " (log2 fold-change)",sep=""))+
+  annotate(geom="text", x=quantile(dat$x,.991,na.rm=T), y=quantile(dat$y,.01,na.rm=T), label=paste("rho=",round(correl,3)),
+              color="black") 
+}
+
+if(0){
+  ggpubr::ggarrange(compare_hits(comp_changes_merged,"eft3p..WT.1xAID..Aux","eif3Bp..WT.1xAID..Aux","eft-3p::79F; 1xAID","eif-3Bp::79F; 1xAID"),
+  compare_hits(comp_changes_merged,"eft3p..WT.1xAID..Aux","eft3p..F79G.1xAID..5ph","eft-3p::79F; 1xAID","eft-3p::F79G; 1xAID"),
+  compare_hits(comp_changes_merged,"eft3p..WT.1xAID..Aux","eft3p..F79A.1xAID..5ad","eft-3p::79F; 1xAID","eft-3p::F79A; 1xAID"),
+    compare_hits(comp_changes_merged,"eif-3p..WT.1xAID..Aux","eft3p..WT.3xAID..Aux","eft-3p::79F; 1xAID","eft-3p::79F; 3xAID"),
+  ncol=4,nrow=1)
+  ggsave("figures/3/auxin_dependent_genes_comparing_TIR1.pdf",height=5,width=20)
+}
+
+ggpubr::ggarrange(
+compare_hits(comp_changes_merged,"eft3p..WT.1xAID..Aux","eft3p..F79A.1xAID..5ad","eft-3p::79F; 1xAID","eft-3p::F79A; 1xAID"),
+compare_hits(comp_changes_merged,"eft3p..WT.1xAID..Aux","eft3p..F79G.1xAID..5ph","eft-3p::79F; 1xAID","eft-3p::F79G; 1xAID"),
+compare_hits(comp_changes_merged,"eft3p..F79G.1xAID..5ph","eft3p..F79A.1xAID..5ad","eft-3p::F79G; 1xAID","eft-3p::F79A; 1xAID"),
+compare_hits(comp_changes_merged,"eft3p..WT.1xAID..Aux","eif3Bp..WT.1xAID..Aux","eft-3p::79F; 1xAID","eif-3Bp::79F; 1xAID"),
+            compare_hits(comp_changes_merged,"eif3Bp..WT.1xAID..Aux","eif3Bp..WT.3xAID..Aux","eif-3Bp::79F; 1xAID","eif-3Bp::79F; 3xAID"),ncol=5,nrow=1)
+ggsave("figures/3/auxin_dependent_genes_comparing_TIR1.pdf",height=4,width=20)
+
+
+
+
+genes_to_plot = c(
+eft3 = geneid[GeneSymbol=="eef-1A.1",GeneName],
+eif1 = geneid[GeneSymbol=="eif-3.B",GeneName],
+#daf2 = geneid[GeneSymbol=="daf-2",GeneName],
+tbb4 = geneid[GeneSymbol=="tbb-4",GeneName],
+unc54 = geneid[GeneSymbol=="unc-54",GeneName])
+deseq_res3 = deseq_res2[GeneName %in% genes_to_plot,]
+deseq_res3[,label:=geneid[GeneName,GeneSymbol]]
+ggplot(deseq_res3,aes(log2FoldChange,-log10(padj),label=label,color=padj<.01))+geom_point()+geom_text_repel()+facet_wrap(~Tir1_type)+geom_text_repel()+geom_abline(slope=1,intercept=0,color="gray")
+
+
+  
+  deseq_res_sub = deseq_res2[padj<.01 & abs(log2FoldChange) > 1,]
+  deseq_res_sub[,label:=geneid[GeneName,GeneSymbol]]
+  res = table(deseq_res_sub$label)
+  res = res[order(res,decreasing=T)]
+  res
+
+
+```
+
+```{r}
+#look for genes differentially regulated in the presence of auxin:
+#cluster RNA's based on raw correlation and make nice dendogram heatmap
+	library(dendextend)
+library(ComplexHeatmap)
+	recalc_corr=T
+	if (recalc_corr){
+	  
+	  fc_sig_ts_df = data.table(dcast(deseq_res2_sig,GeneName~Tir1_type,value.var="log2FoldChange"))
+	  fc_sig_ts = fc_sig_ts_df;
+	  fc_sig_ts[,GeneName:=NULL]
+	  fc_sig_ts = as.matrix(fc_sig_ts);
+	  rownames(fc_sig_ts) = fc_sig_ts_df$GeneName
+		corr_m = matrix(NA,nrow=dim(fc_sig_ts)[2],ncol=dim(fc_sig_ts)[2])
+		rownames(corr_m) = colnames(corr_m) = colnames(fc_sig_ts)
+		for (i in 1:dim(fc_sig_ts)[2]){
+			for (j in 1:dim(fc_sig_ts)[2]){
+				corr_m[i,j] = cor(fc_sig_ts[,i],fc_sig_ts[,j], method = "s")
+			}
+		}
+	}
+	if (recalc_corr){
+	 				corr_r = t(cor(t(fc_sig_ts), method = "p"))
+	}
+	#colfunc <- colorRampPalette(c("blue", "white","red"))
+	#rampbreaks <- seq(-1, 1, length.out = 512+1)
+
+
+	clustered_dat =hclust(as.dist(1-corr_m), method = "complete")
+	TIR1_dendogram = as.dendrogram(clustered_dat)
+	
+	clustered_dat =hclust(as.dist(1-corr_r), method = "ward.D2")
+	gene_dendogram = as.dendrogram(clustered_dat)
+  gene_order = clustered_dat$order
+	
+	gp = Heatmap(fc_sig_ts,
+	             #cluster_rows=gene_dendogram,
+	             cluster_columns=TIR1_dendogram,
+	            # row_order=gene_order,
+	             row_labels =rep("",nrow(fc_sig_ts)))
+  plot(gp)
+  pdf("auxin-dependent_dendogram.pdf",width=10,height=10)
+  plot(gp)
+  dev.off()
+  corr_m2 = corr_m
+  diag(corr_m2) = NA
+  	gp = Heatmap(corr_m2,
+	             cluster_rows=TIR1_dendogram,
+	             cluster_columns=TIR1_dendogram, 
+	             cell_fun = function(j, i, x, y, width, height, fill) {
+               grid.text(if(!is.na(corr_m2[i,j]))sprintf("%.1f", corr_m2[i, j]), x, y, gp = gpar(fontsize = 12))})
+  	
+  	
+```
+
+#plot transcriptomic PCA correlations with phenotypes
+```{r fig.width=16,fig.height=5}
+library(RColorBrewer)
+annots = annotations_d2[ Day == 1,]
+annots[,Tir1_type := ifelse(Promoter=="wo","none",paste(Promoter,Tir1))]
+annots$Tir1_type_f = factor(annots$Tir1_type,levels=c("none","eif3Bp WT","eft3p WT","eft3p F79A","eft3p F79G"))
+annots[,Tir1_type_all_conditions := paste0(ifelse(Promoter=="wo","none",paste0(Promoter,"::",Tir1,";",daf2AID,"xAID")),ifelse(Auxin,paste0(".",AuxinType),""))]
+
+daf2_effect_counts = counts_d2[!grepl("ERCC",rownames(counts_d2)),annots$Basename]
+daf2_effect_counts = daf2_effect_counts[all_sig_changed_genes_on_Auxin_in_most_conditions,]
+r_means = rowMeans(daf2_effect_counts)
+r_zeros = apply(daf2_effect_counts,1,FUN=function(x)sum(x>0))
+counts_filtered = daf2_effect_counts[r_means>30 & r_zeros>3*ncol(daf2_effect_counts)/4,]
+
+nf = normalizationFactor(counts_filtered)
+counts_filtered = sweep(counts_filtered, 2, nf, "/")
+
+pr_res = prcomp(t(log10(counts_filtered+1)),scale=T,center=T)
+
+pc_var <- data.frame(PC=1:length(pr_res$sdev), frac_variance =pr_res$sdev^2/sum(pr_res$sdev^2))
+
+
+
+loadings = data.frame(pr_res$x)
+loadings$Basename = rownames(loadings)
+loadings_annotated = data.table(merge(loadings,annots,by="Basename"))
+
+TIR1_colors = c(brewer.pal(4,"Set2"),"dark gray")
+typ = unique(apply(loadings_annotated,1,function(x)paste(x[["Promoter"]],x[["Tir1"]])))
+typ = typ[order(typ)]
+names(TIR1_colors) = typ
+PC1_vs_PC2 = ggplot(loadings_annotated,aes(PC1,PC2,
+                                           fill=paste(Promoter,Tir1),
+                                           stroke=Auxin,
+                                           size=Auxin,color=AuxinType,
+                                           shape=factor(daf2AID)))+  
+    scale_shape_manual("degron",values = c(24,21,23))+
+    scale_discrete_manual(aesthetics = "stroke",values = c(NA,1))+
+    scale_color_manual("Auxin",values = c("wo"="#FFFFFF","Aux"="#000000","5ad"="#880000","5ph"="#000088"))+
+    scale_fill_manual("Tir1",values=TIR1_colors)+
+    scale_size_manual("Auxin",values = c(4,3,3,3))+
+    guides(fill = guide_legend(override.aes = list(shape = 21, colour = NA,size=4)),
+           shape = guide_legend(override.aes = list(size=4)),
+           color = guide_legend(override.aes = list(shape = 21, fill="white",size=4)),
+          size = "none")+ 
+  
+    geom_point(lwd=2)+ 
+    xlab(paste0("Principal Component 1 (",round(pc_var[1,2]*100),"%)"))+
+    ylab(paste0("Principal Component 2 (",round(pc_var[2,2]*100),"%)"))
+
+PC1_vs_PC3 = ggplot(loadings_annotated,aes(PC1,-PC3,
+                                           fill=paste(Promoter,Tir1),
+                                           stroke=Auxin,
+                                           size=Auxin,color=AuxinType,
+                                           shape=factor(daf2AID)))+  
+    scale_shape_manual("degron",values = c(24,21,23))+
+    scale_discrete_manual(aesthetics = "stroke",values = c(NA,1))+
+    scale_color_manual("Auxin",values = c("wo"="#FFFFFF","Aux"="#000000","5ad"="#880000","5ph"="#000088"))+
+    scale_fill_manual("Tir1",values=TIR1_colors)+
+    scale_size_manual("Auxin",values = c(4,3,3,3))+
+    guides(fill = guide_legend(override.aes = list(shape = 21, colour = NA,size=4)),
+           shape = guide_legend(override.aes = list(size=4)),
+           color = guide_legend(override.aes = list(shape = 21, fill="white",size=4)),
+          size = "none")+ 
+  
+    geom_point(lwd=2)+ 
+    xlab(paste0("Principal Component 1 (",round(pc_var[1,2]*100),"%)"))+
+    ylab(paste0("Principal Component 3 (",round(pc_var[3,2]*100),"%)"))
+
+
+loadings_annotated = data.table(merge(loadings_annotated,phenotype_data,by=c("Tir1","Promoter","daf2AID","Auxin","AuxinType")))
+
+loadings_annotated[,label := paste(Promoter,ifelse(Promoter=="wo","",Tir1),ifelse(Auxin,"+AUX",""),daf2AID)]
+means = data.table(aggregate(PC1~label,loadings_annotated,mean))
+means=means[order(PC1),]
+loadings_annotated[,label_f :=factor(label,levels=means$label)] 
+
+
+compound_vs_PC2 = ggplot(loadings_annotated,aes(factor(Tir1),loadings_annotated$PC2,
+                                           fill=paste(Promoter,Tir1),
+                                           stroke=Auxin,
+                                           size=Auxin,color=Auxin,
+                                           shape=factor(daf2AID)))+  
+    scale_shape_manual("degron",values = c(21,23))+
+      scale_discrete_manual(
+    aesthetics = "stroke",
+    values = c(NA,1))+
+    scale_color_manual("Auxin",values = c("#FFFFFF","#000000"))+
+    scale_fill_brewer("Tir1",palette = "Set2")+
+    scale_size_manual("Auxin",values = c(4,3))+
+    guides(fill = guide_legend(override.aes = list(shape = 21, colour = NA,size=4)),
+           shape = guide_legend(override.aes = list(size=4)),
+           color = guide_legend(override.aes = list(shape = 21, fill="white",size=4)),
+          size = "none")+ 
+  
+    geom_point()+ 
+    xlab(paste0("Principal Component 1 (",round(pc_var[1,2]*100),"%)"))+
+    ylab(paste0("Principal Component 2 (",round(pc_var[2,2]*100),"%)"))#+
+    
+  #annotate(geom="text", x=0, y=-10, label=paste("rho=",round(cr,3)),
+  #            color="black")
+
+cr = cor(loadings_annotated$PC1,loadings_annotated$lifespan.mean,method='p')
+lifespan_vs_PC1 = 
+  ggplot(loadings_annotated,aes(PC1,lifespan.mean,
+                                           ))+  
+    scale_shape_manual("degron",values = c(21,23))+
+      scale_discrete_manual(
+    aesthetics = "stroke",
+    values = c(NA,1))+
+    scale_color_manual("Auxin",values = c("#FFFFFF","#000000"))+
+    scale_fill_brewer("Tir1",palette = "Set2")+
+    scale_size_manual("Auxin",values = c(4,3))+
+    guides(fill = guide_legend(override.aes = list(shape = 21, colour = NA,size=4)),
+           shape = guide_legend(override.aes = list(size=4)),
+           color = guide_legend(override.aes = list(shape = 21, fill="white",size=4)),
+          size = "none")+ 
+  
+   geom_errorbar(aes(ymin=lifespan.mean-lifespan.stderr,ymax=lifespan.mean+lifespan.stderr),alpha=.75,lwd=1,color="black")+
+  geom_point(aes(fill=paste(Promoter,Tir1),
+                                           stroke=Auxin,
+                                           size=Auxin,
+                                           color=Auxin,
+                                           shape=factor(daf2AID)))+ 
+    geom_smooth(aes(shape=NULL,fill=NULL,size=NULL,stroke=NULL,color=NULL),color="dark gray",method="lm",se=F,lwd=1)+
+  
+  annotate(geom="text", x=10, y=10, label=paste("rho=",round(cr,3)),
+              color="black")+xlab(paste0("Principal Component 1 (",round(pc_var[1,2]*100),"%)"))+ylab("Mean Lifespan (days)")
+
+cr = cor(loadings_annotated[Auxin==T]$PC1,loadings_annotated[Auxin==T]$lifespan.mean,method='p')
+lifespan_vs_PC1_with_auxin = 
+  ggplot(loadings_annotated[Auxin==T],aes(PC1,lifespan.mean))+  
+    scale_shape_manual("degron",values = c(21,23))+
+      scale_discrete_manual(
+    aesthetics = "stroke",
+    values = c(1))+
+    scale_color_manual("Auxin",values = c("#000000"))+
+    scale_fill_brewer("Tir1",palette = "Set2")+
+    scale_size_manual("Auxin",values = c(4,3))+
+    guides(fill = guide_legend(override.aes = list(shape = 21, colour = NA,size=4)),
+           shape = guide_legend(override.aes = list(size=4)),
+           color = guide_legend(override.aes = list(shape = 21, fill="white",size=4)),
+          size = "none")+ 
+  
+   geom_errorbar(aes(ymin=lifespan.mean-lifespan.stderr,ymax=lifespan.mean+lifespan.stderr),alpha=.75,lwd=1,color="black")+
+  geom_point(aes(fill=paste(Promoter,Tir1),
+                                           stroke=Auxin,
+                                           size=Auxin,
+                                           color=Auxin,
+                                           shape=factor(daf2AID)))+ 
+    geom_smooth(aes(shape=NULL,fill=NULL,size=NULL,stroke=NULL,color=NULL),color="dark gray",method="lm",se=F,lwd=1)+
+   
+  annotate(geom="text", x=10, y=25, label=paste("rho=",round(cr,3)),
+              color="black")+xlab(paste0("Principal Component 1 (",round(pc_var[1,2]*100),"%)"))+ylab("Mean Lifespan (days)")
+
+cr = cor(loadings_annotated[Auxin==F]$PC1,loadings_annotated[Auxin==F]$lifespan.mean,method='p')
+lifespan_vs_PC1_without_auxin = 
+  ggplot(loadings_annotated[Auxin==F],aes(PC1,lifespan.mean))+  
+    scale_shape_manual("degron",values = c(21,23))+
+      scale_discrete_manual(
+    aesthetics = "stroke",
+    values = c(NA,1))+
+    scale_color_manual("Auxin",values = c("#FFFFFF"))+
+    scale_fill_brewer("Tir1",palette = "Set2")+
+    scale_size_manual("Auxin",values = c(4,3))+
+    guides(fill = guide_legend(override.aes = list(shape = 21, colour = NA,size=4)),
+           shape = guide_legend(override.aes = list(size=4)),
+           color = guide_legend(override.aes = list(shape = 21, fill="white",size=4)),
+          size = "none")+ 
+  
+   geom_errorbar(aes(ymin=lifespan.mean-lifespan.stderr,ymax=lifespan.mean+lifespan.stderr),alpha=.75,lwd=1,color="black")+
+  geom_point(aes(fill=paste(Promoter,Tir1),
+                                           stroke=Auxin,
+                                           size=Auxin,
+                                           color=Auxin,
+                                           shape=factor(daf2AID)))+ 
+    geom_smooth(aes(shape=NULL,fill=NULL,size=NULL,stroke=NULL,color=NULL),color="dark gray",method="lm",se=F,lwd=1)+
+  annotate(geom="text", x=-5, y=10.75, label=paste("rho=",round(cr,3)),
+              color="black")  +xlab(paste0("Principal Component 1 (",round(pc_var[1,2]*100),"%)"))+ylab("Mean Lifespan (days)")
+
+
+pc_lifespan_corrs = rbindlist(lapply(1:30,function(p){
+  pc_text= paste("PC",p,sep="")
+  data.frame(pc=p,cor=cor(-loadings_annotated[,get(pc_text)],loadings_annotated$lifespan.mean,method='p'))
+}))
+pc_lifespan_corrs$pc_f = factor(pc_lifespan_corrs$pc,levels=pc_lifespan_corrs$pc[order(abs(pc_lifespan_corrs$cor),decreasing=T)])
+
+  
+la_cur = loadings_annotated[!is.na(dauer.mean) & Auxin==F,]
+
+Bset = .075
+f_mod = nls(dauer.mean~SSfpl((PC3), A=0, B=Bset, xmid, scal=s), data = la_cur,start = c(xmid=0,s=.1))
+rng = range(la_cur$PC3)
+newx = seq(rng[1],rng[2],length.out=100)
+pred_dat = data.frame(PC3=newx,
+                      dauer.mean=predict(f_mod,newdata = data.frame(PC3=newx)))
+pred_dat$label="fit"
+frac_dauer_vs_PC3 = 
+  ggplot(la_cur,aes(PC3,dauer.mean,color=(label)))+
+  geom_line(data=pred_dat,color="dark gray",size=2)+ylab("Fraction Dauer")+  
+  scale_shape_manual("degron",values = c(21,23))+
+      scale_discrete_manual(
+    aesthetics = "stroke",
+    values = c(1))+
+    scale_color_manual("Auxin",values = c("#000000"))+
+    scale_fill_brewer("Tir1",palette = "Set2")+
+    scale_size_manual("Auxin",values = c(4,3))+
+    guides(fill = guide_legend(override.aes = list(shape = 21, colour = NA,size=4)),
+           shape = guide_legend(override.aes = list(size=4)),
+           color = guide_legend(override.aes = list(shape = 21, fill="white",size=4)),
+          size = "none")+  
+    geom_point(aes(fill=paste(Promoter,Tir1),
+                                           stroke=Auxin,
+                                           size=Auxin,
+                                           color=Auxin,
+                                           shape=factor(daf2AID)))+
+   geom_errorbar(aes(ymin=dauer.mean-dauer.stderr,ymax=dauer.mean+dauer.stderr,
+                     fill=paste(Promoter,Tir1),
+                                           stroke=Auxin,
+                                           size=Auxin,
+                                           color=Auxin,
+                                           shape=factor(daf2AID)),alpha=.75,color="black",lwd=1) +xlab(paste0("Principal Component 3 (",round(pc_var[1,2]*100),"%)"))
+
+
+means = data.table(aggregate(PC2~label,loadings_annotated,mean))
+means=means[order(PC2),]
+loadings_annotated[,label_f :=factor(label,levels=means$label)] 
+lifespan_vs_PC2 = ggplot(loadings_annotated,aes(PC2,lifespan.mean,color=label))+geom_point()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+geom_smooth(aes(color=NULL),method="lm",se=F)
+frac_dauer_vs_PC2 = ggplot(loadings_annotated[!is.na(dauer.mean),],aes(PC2,dauer.mean,color=(label)))+geom_point()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+geom_smooth(aes(color=NULL),method="lm",se=F)
+
+frac_dauer_vs_PC1 = 
+  ggplot(la_cur,aes(PC1,dauer.mean,color=(label)))+ylab("Fraction Dauer")+  
+  scale_shape_manual("degron",values = c(21,23))+
+      scale_discrete_manual(
+    aesthetics = "stroke",
+    values = c(1))+
+    scale_color_manual("Auxin",values = c("#000000"))+
+    scale_fill_brewer("Tir1",palette = "Set2")+
+    scale_size_manual("Auxin",values = c(4,3))+
+    guides(fill = guide_legend(override.aes = list(shape = 21, colour = NA,size=4)),
+           shape = guide_legend(override.aes = list(size=4)),
+           color = guide_legend(override.aes = list(shape = 21, fill="white",size=4)),
+          size = "none")+  
+    geom_point(aes(fill=paste(Promoter,Tir1),
+                                           stroke=Auxin,
+                                           size=Auxin,
+                                           color=Auxin,
+                                           shape=factor(daf2AID)))+
+   geom_errorbar(aes(ymin=dauer.mean-dauer.stderr,ymax=dauer.mean+dauer.stderr,
+                     fill=paste(Promoter,Tir1),
+                                           stroke=Auxin,
+                                           size=Auxin,
+                                           color=Auxin,
+                                           shape=factor(daf2AID)),alpha=.75,color="black",lwd=1) +xlab(paste0("Principal Component 3 (",round(pc_var[1,2]*100),"%)"))
+
+
+means = data.table(aggregate(PC2~label,loadings_annotated,mean))
+means=means[order(PC2),]
+loadings_annotated[,label_f :=factor(label,levels=means$label)] 
+lifespan_vs_PC2 = ggplot(loadings_annotated,aes(PC2,lifespan.mean,color=label))+geom_point()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+geom_smooth(aes(color=NULL),method="lm",se=F)
+frac_dauer_vs_PC2 = ggplot(loadings_annotated[!is.na(dauer.mean),],aes(PC2,dauer.mean,color=(label)))+geom_point()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+geom_smooth(aes(color=NULL),method="lm",se=F)
+
+library(RColorBrewer)
+pc1 = pr_res$rotation[,2]
+pc1 = data.frame(GeneName = names(pc1),GeneSymbol=geneid[names(pc1),GeneSymbol],val=pc1)
+pc1 = pc1[order(abs(pc1$val),decreasing=T),]
+
+loadings_annotated_just_auxin = loadings_annotated[Auxin==T,]
+loadings_annotated_just_auxin[,label := paste(Promoter,ifelse(Promoter=="wo","",Tir1),daf2AID)]
+loadings_annotated_just_auxin2 = merge(loadings_annotated_just_auxin,dauer_p50,by=c("Tir1","Promoter","daf2AID"))
+#ggplot(loadings_annotated_just_auxin2,aes(PC1,xmid,color=label))+geom_point()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+geom_smooth(aes(color=NULL),method="lm",se=F)+facet_wrap(~Tir1,scale="free")
+#ggplot(loadings_annotated_just_auxin2,aes(PC2,xmid,color=(label)))+geom_point()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+geom_smooth(aes(color=NULL),method="lm",se=F)+facet_wrap(~Tir1,scale="free")
+
+dauer_IC50_vs_PC1_auxin= ggplot(loadings_annotated_just_auxin2,aes(PC1,xmid))+
+    scale_shape_manual("degron",values = c(21,23))+
+      scale_discrete_manual(
+    aesthetics = "stroke",
+    values = c(1))+
+    scale_color_manual("Auxin",values = c("#000000"))+
+    scale_fill_brewer("Tir1",palette = "Set2")+
+    scale_size_manual("Auxin",values = c(4,3))+
+    guides(fill = guide_legend(override.aes = list(shape = 21, colour = NA,size=4)),
+           shape = guide_legend(override.aes = list(size=4)),
+           color = guide_legend(override.aes = list(shape = 21, fill="white",size=4)),
+          size = "none")+ 
+   geom_errorbar(aes(ymin=xmid.lci,ymax=xmid.uci,fill=paste(Promoter,Tir1),
+                                           stroke=Auxin,
+                                           size=Auxin,
+                                           color=Auxin,
+                                           shape=factor(daf2AID)),alpha=.75,color="black",lwd=1)+
+  geom_point(aes(fill=paste(Promoter,Tir1),
+                                           stroke=Auxin,
+                                           size=Auxin,
+                                           color=Auxin,
+                                           shape=factor(daf2AID)))+ 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+    geom_smooth(aes(bg=NULL,shape=NULL,color=NULL),color="dark gray",method="lm",se=F)+
+   
+    xlab(paste0("Principal Component 1 (",round(pc_var[1,2]*100),"%)"))+ylab("Dauer IC50 (uM)")+  
+    scale_y_continuous(trans="log10") + 
+  annotate(geom="text", x=7, y=.5, label=paste("rho=",round(cr,3)),
+              color="black")
+
+
+cr = cor(loadings_annotated_just_auxin2$PC2,log10(loadings_annotated_just_auxin2$xmid),method='p')
+
+dauer_IC50_vs_PC2_auxin=
+  ggplot(loadings_annotated_just_auxin2,aes(PC2,xmid))+
+    scale_shape_manual("degron",values = c(21,23))+
+      scale_discrete_manual(
+    aesthetics = "stroke",
+    values = c(1))+
+    scale_color_manual("Auxin",values = c("#000000"))+
+    scale_fill_brewer("Tir1",palette = "Set2")+
+    scale_size_manual("Auxin",values = c(4,3))+
+    guides(fill = guide_legend(override.aes = list(shape = 21, colour = NA,size=4)),
+           shape = guide_legend(override.aes = list(size=4)),
+           color = guide_legend(override.aes = list(shape = 21, fill="white",size=4)),
+          size = "none")+ 
+   geom_errorbar(aes(ymin=xmid.lci,ymax=xmid.uci,
+                     fill=paste(Promoter,Tir1),
+                                           stroke=Auxin,
+                                           size=Auxin,
+                                           color=Auxin,
+                                           shape=factor(daf2AID)),alpha=.75,color="black",lwd=1)+
+  geom_point(aes(fill=paste(Promoter,Tir1),
+                                           stroke=Auxin,
+                                           size=Auxin,
+                                           color=Auxin,
+                                           shape=factor(daf2AID)))+ 
+    geom_smooth(aes(bg=NULL,shape=NULL,color=NULL),color="dark gray",method="lm",se=F)+
+   
+    xlab(paste0("Principal Component 2 (",round(pc_var[2,2]*100),"%)"))+ylab("Dauer IC50 (uM)")+  
+    scale_y_continuous(trans="log10") + 
+  annotate(geom="text", x=7, y=.5, label=paste("rho=",round(cr,3)),
+              color="black")
+  
+
+pc_dauer_corrs = rbindlist(lapply(1:30,function(p){
+  pc_text= paste("PC",p,sep="")
+  data.frame(pc=p,cor=cor(-loadings_annotated_just_auxin2[,get(pc_text)],log10(loadings_annotated_just_auxin2$xmid),method='p'))
+}))
+pc_dauer_corrs$pc_f = factor(pc_dauer_corrs$pc,levels=pc_dauer_corrs$pc[order(abs(pc_dauer_corrs$cor),decreasing=T)])
+pc_dauer=ggplot(pc_dauer_corrs[pc<15,],aes(pc_f,abs(cor)))+geom_point(size=3)+xlab("Principal Component")+ylab("Correlation between\nDauder IC50 and PC")+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+pc_lifespan=ggplot(pc_lifespan_corrs[pc<15,],aes(pc_f,abs(cor)))+geom_point(size=3)+xlab("Principal Component")+ylab("Correlation between\nMean Lifespan and PC")+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+pc_frac_var = ggplot(pc_var[pc_var$PC<15,],aes(PC,frac_variance))+geom_point(size=3)+xlab("Principal Component")+ylab("Fraction of gene-expression\nvariance explained")+ scale_x_continuous(breaks=1:30)+theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+
+loadings_annotated_no_auxin = loadings_annotated[Auxin==F,]
+loadings_annotated_no_auxin[,label := paste(Promoter,ifelse(Promoter=="wo","",Tir1),daf2AID)]
+loadings_annotated_no_auxin2 = merge(loadings_annotated_no_auxin,dauer_p50,by=c("Tir1","Promoter","daf2AID"))
+
+dauer_IC50_vs_PC1_no_auxin= ggplot(loadings_annotated_no_auxin2,aes(PC3,xmid))+
+    scale_shape_manual("degron",values = c(21,23))+
+      scale_discrete_manual(
+    aesthetics = "stroke",
+    values = c(NA))+
+    scale_color_manual("Auxin",values = c("#FFFFFF"))+
+    scale_fill_brewer("Tir1",palette = "Set2")+
+    scale_size_manual("Auxin",values = c(4,3))+
+    guides(fill = guide_legend(override.aes = list(shape = 21, colour = NA,size=4)),
+           shape = guide_legend(override.aes = list(size=4)),
+           color = guide_legend(override.aes = list(shape = 21, fill="white",size=4)),
+          size = "none")+ 
+   geom_errorbar(aes(ymin=xmid.lci,ymax=xmid.uci,fill=paste(Promoter,Tir1),
+                                           stroke=Auxin,
+                                           size=Auxin,
+                                           color=Auxin,
+                                           shape=factor(daf2AID)),alpha=.75,color="black",lwd=1)+
+  geom_point(aes(fill=paste(Promoter,Tir1),
+                                           stroke=Auxin,
+                                           size=Auxin,
+                                           color=Auxin,
+                                           shape=factor(daf2AID)))+ 
+    geom_smooth(aes(bg=NULL,shape=NULL,color=NULL),color="dark gray",method="lm",se=F)+
+   
+    xlab(paste0("Principal Component 3 (",round(pc_var[1,2]*100),"%)"))+ylab("Dauer IC50 (uM)")+  
+    scale_y_continuous(trans="log10") + 
+  annotate(geom="text", x=7, y=.5, label=paste("rho=",round(cr,3)),
+              color="black")
+
+pc_dauer_no_auxin_corrs = rbindlist(lapply(1:30,function(p){
+  pc_text= paste("PC",p,sep="")
+  data.frame(pc=p,cor=cor(-loadings_annotated_no_auxin2[,get(pc_text)],log10(loadings_annotated_no_auxin2$xmid),method='p'))
+}))
+
+
+
+
+ggpubr::ggarrange(PC1_vs_PC2,lifespan_vs_PC1 + theme(legend.position="none"),frac_dauer_vs_PC3 + theme(legend.position="none"),ncol=3,nrow=1,widths=c(1.5,1,1))
+ggsave("figures/3/pca_vs_phenotype.pdf",width= 20,height=5)
+ggpubr::ggarrange(lifespan_vs_PC1_with_auxin,lifespan_vs_PC1_without_auxin,ncol=2)
+ggsave("figures/3/pca_vs_phenotype_S1.pdf",width= 12,height=5)
+ggpubr::ggarrange(pc_frac_var,pc_lifespan,pc_dauer,ncol=3)
+ggsave("figures/3/pca_vs_phenotype_S2.pdf",width= 12,height=3)
+```
+
+
+```{r}
+if (0){
+#effect of adding auxin to eft3p::TIR1
+annots = annotations_d2[Promoter=="eft3p" & !is.na(Tir1) & daf2AID == 1 & Day == 1,]
+daf2_effect_counts = counts_d2[!grepl("ERCC",rownames(counts_d2)),annots$Basename]
+nf = normalizationFactor(daf2_effect_counts)
+deseq_res = runDESeq(daf2_effect_counts,annots,nf,~Auxin)
+deseq_res2 = formatDESeq(deseq_res)
+deseq_res2$hit = abs(deseq_res2$AuxinTRUE_log2FoldChange)>2 & deseq_res2$AuxinTRUE_padj<.001
+setkey(geneid,GeneName)
+deseq_res2[,GeneSymbol := geneid[GeneName,GeneSymbol]]
+auxin_effect_on_degron = deseq_res2
+ggplot(auxin_effect_on_degron,aes(AuxinTRUE_log2FoldChange,-log(AuxinTRUE_padj),color=hit,label=ifelse(hit==T,GeneSymbol,""))) + geom_point() + geom_text_repel()
+table(abs(auxin_effect_on_degron$hit))
+```
+```{r}
+TSM_auxin_effect_on_degron = ns_fit_set_da_linear_model(list(all_samples=counts_d2[,annotations_d2[Day ==1,Basename]],
+                                                               wildtype=counts_d2[,annotations_d2[label=="+;+" & Day == 1,Basename]]),
+                                                        allow_recursion_for_outliers=0,auxin_effect_on_degron,
+                                                        "AuxinTRUE_log2FoldChange","",
+                                                          reference_group="wildtype")
+}
+```
+
+```{r}
+if(0){
+coefs = annotations_d2;
+coefs$sf = res$all_samples$coef[coefs$Basename]
+d1 = coefs[Day==1,]
+d1_mean = aggregate(sf~label,d1,FUN=mean)
+d1_mean = d1_mean[order(d1_mean$sf),]
+d1$label_f = factor(d1$label,levels=d1_mean$label)
+ggplot(d1,aes(label_f,sf)) + geom_point() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+}
+```
+
+
+
+```{r}
+if (0){
+#auxin independent effect 
+annots = annotations_d2[(label=="+;+" | label == "eft3p::TIR1(WT);1xAID") & Day ==1,]
+daf2_effect_counts = counts_d2[!grepl("ERCC",rownames(counts_d2)),annots$Basename]
+nf = normalizationFactor(daf2_effect_counts)
+deseq_res = runDESeq(daf2_effect_counts,annots,nf,~Strain)
+deseq_res2 = formatDESeq(deseq_res)
+deseq_res2$hit = abs(deseq_res2$Strain_QZ0_vs_Amp145_log2FoldChange)>2 & deseq_res2$Strain_QZ0_vs_Amp145_padj<.05
+setkey(geneid,GeneName)
+deseq_res2[,GeneSymbol := geneid[GeneName,GeneSymbol]]
+auxin_independent_effect_of_daf2_degron = deseq_res2;
+
+ggplot(deseq_res2,aes(Strain_QZ0_vs_Amp145_log2FoldChange,-log(Strain_QZ0_vs_Amp145_padj),color=hit,label=ifelse(hit==T,GeneSymbol,""))) + geom_point() + geom_text_repel()
+table(abs(deseq_res2$hit))
+```
+```{r}
+TSM_auxin_independent_effect = ns_fit_set_da_linear_model(list(all_samples=counts_d2[,annotations_d2[Day ==1,Basename]],
+                                                               wildtype=daf2_effect_counts[,annots[label=="+;+",Basename]]),
+                                                  
+                                                            differential_analysis=auxin_independent_effect_of_daf2_degron,
+                                                            differential_analysis_column_name ="Strain_QZ0_vs_Amp145_log2FoldChange",
+                                                            RNAi_GeneName_to_exclude="",
+                                                            allow_recursion_for_outliers=0,
+                                                            reference_group="wildtype")
+}
+```
+
+```{r}
+if(0){
+coefs = annotations_d2;
+coefs$sf = -res$all_samples$coef[coefs$Basename]
+d1 = coefs[Day==1,]
+d1_mean = aggregate(sf~label,d1,FUN=mean)
+d1_mean = d1_mean[order(d1_mean$sf),]
+d1$label_f = factor(d1$label,levels=d1_mean$label)
+ggplot(d1,aes(label_f,sf)) + geom_point() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+write.csv(d1,"sfs.csv")
+}
+```
+
+
+
+```{r}
+if(0){
+#effect of adding eft3p in the presence of 1x degron and auxin
+#(eg both background and accute effect
+annots = annotations_d2[label=="+;+ +AUXIN" | label == "eft3p::TIR1(WT);1xAID +AUXIN" & Day == 1,]
+daf2_effect_counts = counts_d2[!grepl("ERCC",rownames(counts_d2)),annots$Basename]
+nf = normalizationFactor(daf2_effect_counts)
+deseq_res = runDESeq(daf2_effect_counts,annots,nf,~Strain)
+deseq_res2 = formatDESeq(deseq_res)
+deseq_res2$hit = abs(deseq_res2$Strain_QZ0_vs_Amp145_log2FoldChange)>2 & deseq_res2$Strain_QZ0_vs_Amp145_padj<.001
+setkey(geneid,GeneName)
+deseq_res2[,GeneSymbol := geneid[GeneName,GeneSymbol]]
+ggplot(deseq_res2,aes(Strain_QZ0_vs_Amp145_log2FoldChange,-log(Strain_QZ0_vs_Amp145_padj),color=hit,label=ifelse(hit==T,GeneSymbol,""))) + geom_point() + geom_text_repel()
+table(abs(deseq_res2$hit))}
+```
+```{r}
+#res = ns_fit_set_da_linear_model(list(all_samples=counts_d2),deseq_res2,"Strain_QZ0_vs_Amp145_log2FoldChange","")
+```
+
+```{r,fig.width=10,fig.height=10}
+if(0){
+coefs = annotations_d2;
+coefs$sf_auxin_dependent = TSM_auxin_effect_on_degron$all_samples$coef[coefs$Basename]
+coefs$sf_auxin_independent = -TSM_auxin_independent_effect$all_samples$coef[coefs$Basename]
+d1 = coefs[Day==1,]
+sf_auxin_dependent_mean = aggregate(sf_auxin_dependent~label,d1,FUN=median)
+sf_auxin_independent = aggregate(sf_auxin_independent~label,d1,FUN=median)
+sf_both = merge(sf_auxin_dependent_mean,sf_auxin_independent,by="label")
+ggplot(sf_both[!grepl("AUXIN",sf_both$label),],aes(sf_auxin_dependent,sf_auxin_independent,color=label,label=label)) +geom_point(size=4)+geom_text_repel() +
+  geom_smooth(aes(color="black",label=""),method="lm",se=F) + 
+  geom_hline(yintercept=0,lty=2,color="gray")+ 
+  geom_vline(xintercept=0,lty=2,color="gray")
+#write.csv(d1,"sfs.csv")
+}
+```

@@ -1,0 +1,961 @@
+```{r}
+#setwd(r"(D:\Dropbox (Personal)\work\writing\crg\2024_07_09=degron_manuscript)")
+
+library(dplyr)
+library(ggplot2)
+library(viridis)
+library(hrbrthemes)
+library(geomtextpath)
+library(cowplot)
+library(extrafont)
+library(RColorBrewer)
+library(ggsci)
+library(drc)
+library(scales)
+library(data.table)
+library(stringr)
+library(ggfortify)
+
+library(devtools)
+if (!("ns.survival.code" %in% rownames(installed.packages())))
+  install_github("nstroustrup/ns.survival.code");
+library(ns.survival.code)
+library(survival)
+library(braidrm)
+library("gridExtra")
+
+extrafont::font_import()
+
+#my_theme function
+my_theme <- function() {
+  theme_cowplot() + 
+      theme(axis.title.x = element_text(size = rel(1), face = "bold"),
+      axis.title.y = element_text(size = rel(1), face = "bold"),
+      legend.text=element_text(size = rel(1)),
+      legend.title=element_text(size = rel(1)),
+      axis.text = element_text(size = rel(1)),
+      axis.line = element_line(linewidth = 0.5),
+      axis.ticks = element_line(linewidth = 0.5),
+      axis.ticks.length=unit(.2, "cm"))
+}
+```
+
+
+```{r}
+#process the merged lifespan data file, adding useful metadata columns
+data = fread("lifespan_data/all_lifespan_merged.csv")
+data[,promoter:=ifelse(grepl("eft-3",`Animal Description`),"eft-3","eif-1")]
+data[,degron:=ifelse(grepl("1x",`Animal Description`),"1x","3x")]
+data[,TIR1_variant:=ifelse(grepl("F79A",`Animal Description`),"F79A",ifelse(grepl("F79G",`Animal Description`),"F79G","79F"))]
+
+t1_variants = c("79F","F79A","F79G")
+compounds = c("KNAA","5-Ad-IAA","5-Ph-IAA")
+names(compounds) = t1_variants
+data[,compound := compounds[TIR1_variant]]
+
+data2 = fread("lifespan_data/qz_controls_and_no_compound_replicate_lifespan.csv")
+lookup_table = unique(data[,.(Strain,promoter,degron,TIR1_variant)])
+setkey(lookup_table,Strain)
+data2[,`:=`(promoter = lookup_table[Strain,promoter],
+      degron = lookup_table[Strain,degron],
+      TIR1_variant = lookup_table[Strain,TIR1_variant])]
+data2[Strain=="qz0",Strain:="QZ0"]
+
+data2[Strain=="QZ0",`:=`(promoter = "none",
+      degron = "none",
+      TIR1_variant = "none")]
+data2$`EXP NUMBER` = max(data$`EXP NUMBER`)+1
+data2[,compound:=ifelse(grepl("K-NAA",`Auxin Concentration`),"KNAA",
+                        ifelse(grepl("5-ph-IAA",`Auxin Concentration`),"5-Ph-IAA",
+                        ifelse(grepl("5-Ad-IAA",`Auxin Concentration`),"5-Ad-IAA","none")))]
+data2[,`Auxin Concentration`:=str_replace(str_replace(str_replace(`Auxin Concentration`,"K-NAA ",""),"5-ph-IAA ",""),"5-Ad-IAA ","")]
+
+data_m = rbind(data,data2)
+data_m[,concentration.uM:=as.numeric(str_replace(str_replace(`Auxin Concentration`,"uM",""),"nM",""))]
+data_m[,concentration.uM:=ifelse(grepl("nM",`Auxin Concentration`),concentration.uM/1000,concentration.uM)] 
+                          
+
+
+fwrite(data_m,"lifespan_data.all_data_formatted.csv.gz")
+rm(data,data2)
+```
+
+```{r}
+#merge multiple files containing dauer data and add useful metadata columns
+dauer_data_wt = fread("dauer/dauer assay wtTIR-1.csv")
+names(dauer_data_wt)[names(dauer_data_wt)=="V5"] = "Concentration"
+dauer_data_wt_long = melt(dauer_data_wt,id.vars=c("AMP","tir-1","promoter","daf-2::AID","Concentration"))
+dauer_data_wt_long = dauer_data_wt_long[!is.na(value)]
+names(dauer_data_wt_long)[names(dauer_data_wt_long)=="AMP"] = "strain"
+names(dauer_data_wt_long)[names(dauer_data_wt_long)=="variable"] = "Date"
+names(dauer_data_wt_long)[names(dauer_data_wt_long)=="value"] = "Percent.Dauer"
+dauer_data_wt_long$Compound="KNAA"
+
+dauer_data_F79GA = fread("dauer/dauer assay F79G F79A.csv")
+names(dauer_data_F79GA)[names(dauer_data_F79GA)=="V5"] = "Compound"
+names(dauer_data_F79GA)[names(dauer_data_F79GA)=="V6"] = "Concentration"
+dauer_data_F79GA_long = melt(dauer_data_F79GA,id.vars=c("strain","tir-1","promoter","daf-2::AID","Concentration","Compound"))
+dauer_data_F79GA_long = dauer_data_F79GA_long[!is.na(value)]
+names(dauer_data_F79GA_long)[names(dauer_data_F79GA_long)=="variable"] = "Date"
+names(dauer_data_F79GA_long)[names(dauer_data_F79GA_long)=="value"] = "Percent.Dauer"
+
+dauer_cross = fread("dauer/dauer_cross_reactivity_assay.csv")
+names(dauer_cross)[names(dauer_cross)=="compound"] = "Compound"
+names(dauer_cross)[names(dauer_cross)=="concentration"] = "Concentration"
+dauer_cross_long = melt(dauer_cross,id.vars=c("strain","tir-1","promoter","daf-2::AID","Concentration","Compound"))
+names(dauer_cross_long)[names(dauer_cross_long)=="variable"] = "Date"
+names(dauer_cross_long)[names(dauer_cross_long)=="value"] = "Percent.Dauer"
+dauer_cross_long[,concentration.uM:=as.numeric(str_replace(str_replace(`Concentration`,"uM",""),"nM",""))]
+dauer_cross_long[,concentration.uM:=ifelse(!grepl("K-NAA",`Compound`),concentration.uM/1000,concentration.uM)] 
+
+all_dauer = rbind(dauer_data_wt_long,dauer_data_F79GA_long)
+all_dauer[,concentration.uM:=as.numeric(str_replace(str_replace(`Concentration`,"uM",""),"nM",""))]
+all_dauer[,concentration.uM:=ifelse(grepl("nM",`Concentration`),concentration.uM/1000,concentration.uM)] 
+fwrite(all_dauer,"all_dauer_merged.csv.gz")
+
+#dauer_cr = fread("dauer_CR.csv")   #old with long degron
+#dauer_cr$`tir-1` = dauer_cr$Genotype
+#dauer_cr$`daf-2::AID` = "1x"
+
+```
+
+
+```{r}
+#load in dauer and lifespan data
+data = fread("lifespan_data.all_data_formatted.csv.gz")
+all_dauer = fread("all_dauer_merged.csv.gz")
+data_long = ns.survival.code::ns_convert_frequencies_into_repeats(data[!is.na(Frequency),],"Frequency")
+data_long[,day := `Day of Adulthood`]
+```
+
+```{r,fig.width=13,fig.height=4}
+dat = data_long[(degron=="1x" & promoter=="eft-3" | promoter=="none") & concentration.uM == 0 & `EXP NUMBER` %in% c(1,4),]
+dat$replicate = dat$`EXP NUMBER`
+#calculate group means and standard errors
+dat[,group_f :=factor(paste(concentration.uM,TIR1_variant,compound,replicate))]
+
+tir_variants = unique(dat$TIR1_variant)
+tir_variants = tir_variants[tir_variants!="none"]
+tir_variants = tir_variants[order(tir_variants)]
+
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+colors = gg_color_hue(3)
+names(colors) =t1_variants
+mk_tir1_label = function(x)ifelse(x=="none","No TIR1",paste0("TIR1[",x,"]"))
+
+
+gps=lapply(tir_variants,function(t1){
+  cur_compound = unique(dat[TIR1_variant==t1 & compound!="none",compound])
+  print(cur_compound)
+  dat2 = dat[TIR1_variant==t1 | TIR1_variant=="none" & compound%in%c("none",cur_compound),]
+  dat2$TIR_lab = mk_tir1_label(dat2$TIR1_variant)
+  color_v = c(colors[t1],"#000000")
+  names(color_v) = mk_tir1_label(c(t1,"none"))
+ # print(color_v)
+  
+  sfit2 = survfit(Surv(day,1-Censor)~TIR_lab, data=dat2)
+
+  
+  #sdiff = survdiff(Surv(day,1-Censor)~TIR1_variant, data=dat2)
+  
+  r = ns_single_bj_group(Surv(dat2$day,1-dat2$Censor)~dat2$TIR_lab,reference_group=mk_tir1_label("none"))
+  fc_lifespan = round(exp(r$coefficients$coefficient),2)
+  pv = formatC(signif(r$coefficients$p, digits=3), digits=3, format="g")
+  
+  lab = paste("FC=",fc_lifespan,"\np=",pv)
+  autoplot(sfit2,surv.linetype = 'solid', conf.int = FALSE,
+         censor.shape = '', censor.size = 0, facets = F,surv.size=1.25)+  
+        labs(color="")+
+        scale_x_continuous("Age (days)",limits=c(0,30))+
+        my_theme() +
+        theme(legend.position=c(.01,.2))+
+        scale_y_continuous("Fraction Surviving",breaks=seq(0,1,.25),labels=c(0,"","0.5","","1"))+
+        scale_color_manual(values=color_v)+
+        annotate(geom="text", x=20,y=.8,label=lab, color="black")
+})
+ ggarrange(plotlist=gps,nrow=1)
+
+ggsave("AID-system_lifespan_effect.pdf",width=13,height=4)
+ggsave("AID-system_lifespan_effect.png",width=13,height=4)
+```
+
+```{r,fig.width=6,fig.height=3}
+#plot the lifespan of existing TIR1 variants (for Fig 1)
+dat = data_long[(degron=="1x" & promoter=="eft-3" | promoter=="none") & `EXP NUMBER` %in% c(1,4),]
+dat$replicate = dat$`EXP NUMBER`
+#calculate group means and standard errors
+dat[,group_f :=factor(paste(concentration.uM,TIR1_variant,compound,replicate))]
+combos = unique(dat[,.(concentration.uM,TIR1_variant,compound,replicate,group_f)])
+setkey(combos,group_f)
+sfit = survfit(Surv(dat$Day,1-dat$Censor)~dat$group_f)
+res = data.table(
+        mean=ns.survival.code::ns_survival_mean(sfit),
+        stderr=ns.survival.code::ns_survival_stderr(sfit),
+        concentration.uM=combos[substring(names(sfit$strata),nchar("dat$groupf=")+2),concentration.uM],
+        TIR1_variant=combos[substring(names(sfit$strata),nchar("dat$groupf=")+2),TIR1_variant],
+        compound=combos[substring(names(sfit$strata),nchar("dat$groupf=")+2),compound],
+        replicate=combos[substring(names(sfit$strata),nchar("dat$groupf=")+2),replicate])
+write.csv(res,"existing_TIR1_mean_lifespan.csv")
+
+res2 = res[compound=="none" ,]
+ggplot(res2,aes(TIR1_variant,mean,ymin=mean-stderr,ymax=mean+stderr))+geom_point()+geom_errorbar()
+
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+gg_color_hue(2)
+
+
+#plot dosage series
+t1_variants = c("79F","F79A","F79G")
+colors = gg_color_hue(3)
+names(colors) =t1_variants
+
+
+#plot everything
+ylim=c(10,27.5)
+ylab = seq(ylim[1],ylim[2],2);
+#scaleFUN <- function(x) sprintf("%.0f", x)
+tir_variants = unique(res$TIR1_variant)
+tir_variants = tir_variants[tir_variants!="none"]
+gps=lapply(tir_variants,function(t1){
+  cur_compound = unique(res[TIR1_variant==t1 & compound!="none",compound])
+  print(cur_compound)
+  res2 = res[TIR1_variant==t1 | TIR1_variant=="none" & compound%in%c("none",cur_compound),]
+  color_v = c(colors[t1],"#555555")
+  names(color_v) = c(t1,"none")
+  print(color_v)
+  ggplot(res2,aes(concentration.uM,mean,color=TIR1_variant,fill=TIR1_variant)) +
+    geom_ribbon(aes(ymax=mean+stderr,ymin=mean-stderr),size=0,lty=0,alpha=.3)+
+    scale_color_manual(values=color_v)+
+    scale_fill_manual(values=color_v)+
+    geom_line(size=1.25)+
+    scale_shape_manual(values=c(21,22,23))+
+    geom_point(size=3,pch=21,color="black")+
+    scale_y_continuous("Mean Lifespan (days)", breaks=ylab, limits=ylim)+ xlab(paste("[",compounds[t1],"] (uM)",sep=""))+
+    my_theme()     + 
+    theme(axis.text.x = element_text(angle = 45, hjust=1),legend.position="none")
+})
+ggarrange(gps[[1]],gps[[2]],gps[[3]],ncol=3)
+ggsave("all_variants_lifespan_mean.pdf",width=8,height=6)
+
+ps = lapply(tir_variants,function(t1){
+  cur_compound = unique(dat[TIR1_variant==t1 & compound!="none",compound])
+  #print(cur_compound)
+  res2 = dat[TIR1_variant==t1 | TIR1_variant=="none" & compound%in%c("none",cur_compound),]
+  res$TIR1_variant = as.character(res$TIR1_variant)
+  summ = aggregate(day~TIR1_variant+compound+concentration.uM,res2,FUN=length);
+  return(data.frame(figure = rep("Fig. 1 c-d",nrow(summ)),
+                    TIR1_variant = summ$TIR1_variant,
+                    compound = summ$compound,
+                    concentration.uM=summ$concentration.uM,
+                    N = summ$day,
+                    units = rep("individuals",nrow(summ))))
+})
+ 
+
+dat2 = dat[concentration.uM %in% c(750,1.875),]
+sfit2 = survfit(Surv(day,1-Censor)~TIR1_variant, data=dat2)
+gp_high = autoplot(sfit2,surv.linetype = 'solid', conf.int = FALSE,
+         censor.shape = '', censor.size = 0, facets = F,surv.size=1.25)+  
+  labs(color="")+scale_x_continuous("Age (days)",limits=c(0,40))+my_theme() +theme(legend.position=c(.01,.2))+scale_y_continuous("Fraction Surviving",breaks=seq(0,1,.25),labels=c(0,"","0.5","","1"))
+
+#fit_excluded_concentrations = c(0.025,10)
+fit_excluded_concentrations = c()
+gps = lapply(t1_variants,function(t1){
+  dat2 = dat[TIR1_variant==t1,]
+  dat2[,group_f :=factor(paste(concentration.uM,TIR1_variant))]
+  levs = as.character(unique(dat2$concentration.uM))
+  levs = levs[order(levs)]
+  #print(levs)
+  dat2$conc = factor(dat2$concentration.uM,levels=levs)
+
+  combos = unique(dat2[,.(conc,TIR1_variant,group_f)])
+  setkey(combos,group_f)
+  sfit2 = survfit(Surv(dat2$Day,1-dat2$Censor)~dat2$conc)
+  
+  colors_t = colorRampPalette(c("black", colors[t1]))(length(levs)+3)
+  colors_t = colors_t[c(1,5:(length(levs)+3))]
+  names(colors_t) = levs;
+  
+  plot_surv = autoplot(sfit2, surv.linetype = 'solid', conf.int = FALSE,
+         censor.shape = '', censor.size = 0, facets = F,surv.size=1.25)+
+  labs(color="",concentration.uM=t1)+scale_x_continuous(paste("Age (days)",t1),limits=c(0,40))+
+    my_theme() +theme(legend.position=c(.01,.5))+
+    scale_y_continuous("Fraction Surviving",breaks=seq(0,1,.25),labels=c(0,"","0.5","","1"))+
+  scale_colour_manual(values=colors_t)
+  bj_fit = ns.survival.code::ns_single_bj_group(Surv(dat2$Day,1-dat2$Censor)~dat2$concentration.uM,"0")
+  
+  cfs = bj_fit$coefficients
+  #browser()
+  cfs$coefficient = exp(cfs$coefficient)
+  cfs$group = as.numeric( cfs$group)
+  #nls_fit = nls(coefficient~SSfpl(group, A=0, B=b, xmid, scal=s), data = cfs,start = c(xmid=median(cfs$coefficient),b=max(cfs$coefficient),s=10))
+  
+ # nls_coef = data.frame(t(coef(nls_fit)))
+ # nls_coef$t1 = t1;
+ # nls_coef$max = max(cfs$coefficient) 
+  
+  rng = range(cfs$group)
+  newx = seq(rng[1],rng[2]*1.5,length.out=100)
+  newdat_logistic = data.frame(group=newx,coefficient=predict(nls_fit,newdata=data.frame(group=newx)))
+  mx = max(cfs$coefficient)
+  mlims = t(matrix(c(NA,NA,1,1,1,6*mx,0,log(mx)),nrow=4,ncol=2))
+  hill_fit <<- findBestHill(coefficient~group,cfs[!cfs$group %in% fit_excluded_concentrations,],defaults=c(1,max(3*cfs$coefficient)),startparv=c(NA,0,mx,NA),mlims=mlims)
+ # browser()
+  hill_fit_coef = hill_fit$allfits[["m3Plc"]]$coefficients
+  print(hill_fit_coef)
+ # stop()
+  #print(res$allfits[[res$bestModIdx]])
+  newdat_hill = data.frame(group=newx,coefficient=evalHillEqn(newx,hill_fit_coef))
+  hill_fit_coef2 = data.frame(t(hill_fit_coef))
+  names(hill_fit_coef2) = c("n","E0","Ef","lnIDM")
+  #the documentation says
+  #E(D) = E0 + (Ef-E0)/(1+(D/IDM)^-n)
+  #but in fact the fits are
+  #E(D) = E0 + (Ef-E0)/(1+(D^-n)*lnIDM))
+  #Note the implicit dependence of the lnIDM on n.
+  #but the IDM parameter stored 
+  hill_fit_coef2$t1 = t1;
+ 
+  aft_plot = ggplot(cfs,aes(group,(coefficient))) + geom_line(data=newdat_hill,color=colors[t1],size=1.25)+
+    geom_errorbar(aes(ymin=coefficient-se,ymax=coefficient+se))+
+    geom_point(size=2) + xlab(paste("[",compounds[t1],"] (uM)",sep=""))+ylab("Fold-change in Lifespan")+   geom_hline(yintercept=as.numeric(hill_fit_coef2["Ef"]),color=colors[t1],lty=2)
+
+  list(plot_surv = plot_surv,bj_fit=bj_fit,aft_plot=aft_plot,logistic_fit=nls_fit,
+       #nls_coef=nls_coef,
+       hill_fit_coef=hill_fit_coef2)
+})
+names(gps) = t1_variants
+
+hill_coef = rbindlist(lapply(t1_variants,function(t1){
+ gps[[t1]]$hill_fit_coef
+}))
+hill_coef$Ka_uM  = exp(hill_coef$lnIDM) #the ligand concentration producing half occupation,
+
+
+to_plot = "plot_surv"
+ggpubr::ggarrange(gps[[1]][[to_plot]],gps[[2]][[to_plot]],gps[[3]][[to_plot]],ncol=1)
+ggsave("TIR1_variants_compound_dosage_survival.pdf",width=6*2/3,height=9*2/3)
+to_plot = "aft_plot"
+max_y = 2.3
+ggpubr::ggarrange(gps[[1]][[to_plot]]+ylim(1,max_y),
+                   gps[[2]][[to_plot]]+ylim(1,max_y),
+                   gps[[3]][[to_plot]]+ylim(1,max_y),ncol=3)
+ggsave("TIR1_variants_AFT_dosage.pdf",width=10,height=2.5)
+               
+
+
+names(hill_coef)[names(hill_coef)=="n"] = "Hill"
+nls_coef_long = melt(hill_coef[,.(Hill,Ka_uM,t1)],id.vars=c("t1"))
+ggplot(nls_coef_long,aes(t1,value))+geom_point()+facet_wrap(~variable,scale="free_y")
+
+cf = gps[[1]]$bj_fit$coefficients
+cf$coefficient = as.numeric(cf$coefficient)
+cf$group = as.numeric(cf$group)
+
+```
+
+```{r}
+library(gridExtra)
+#plot the dauer entry of existing TIR1 variants (For fig 1)
+dat = all_dauer[`daf-2::AID`=="1x" & promoter=="eft-3p",]
+
+#calculate group means and standard errors
+dat_aggregate_1 = aggregate(Percent.Dauer~concentration.uM+`tir-1`+Compound,dat,FUN=mean)
+names(dat_aggregate_1)[4] = "mean"
+standard_error <- function(x) sd(x) / sqrt(length(x))
+dat_aggregate_2 = aggregate(Percent.Dauer~concentration.uM+`tir-1`+Compound,dat,FUN=standard_error)
+names(dat_aggregate_2)[4] = "stderr"
+dat_aggregate = data.table(merge(dat_aggregate_1,dat_aggregate_2,by=c("concentration.uM","tir-1","Compound")))
+dat_aggregate[,mean := mean/100]
+dat_aggregate[,stderr := stderr/100]
+
+#plot everything
+dauer_range = ggplot(dat_aggregate[concentration.uM>0],aes(concentration.uM,mean,fill=`tir-1`, color=`tir-1`,shape=Compound,lty=Compound)) + 
+  geom_point(size=2) + geom_ribbon(aes(ymax=mean+stderr,ymin=mean-stderr),size=0,lty=0,width=0,alpha=.3) +geom_line(size=1.25) + facet_wrap(~`tir-1`,scale="free_x")+my_theme() + scale_x_continuous("Concentration (uM)")+theme(legend.position="none", axis.text.x = element_text(angle = 45, hjust=1))
+
+
+dat_low = dat[concentration.uM == 0,]
+dauer_low=ggplot(dat_low,aes(`tir-1`,Percent.Dauer/100,color=`tir-1`)) + geom_jitter(width=.1) + my_theme()+scale_y_continuous("Fraction Dauer",limits=c(0,.2))+xlab("TIR-1 Variant")+theme(legend.position="none")
+
+
+gp_all_dauer = grid.arrange(dauer_range,                             # First row with one plot spaning over 2 columns
+             dauer_low, # Second row with 2 plots in 2 different columns
+             ncol = 2    ) 
+plot(gp_all_dauer)
+ggsave("TIR1_existing_variants_dauer.pdf",gp_all_dauer,width=16,height=3)
+
+summ = aggregate(Percent.Dauer~`tir-1`+Compound+concentration.uM,dat,FUN=length)
+ps2 =data.frame(figure = rep("Fig. 1 e",nrow(summ)),TIR1_variant = summ$`tir-1`,compound= summ$Compound,concentration.uM =summ$concentration.uM,N = summ$Percent.Dauer)
+ps2$units = "populations"
+
+
+```
+
+```{r}
+quant=fread("quantification_CA1200_JA1880_stats_soma_germline_thresholded.csv")
+quant[,promoter:=ifelse(genotype=="CA1200","eft-3p","eif-3B")]
+
+background = data.table(genotype=c("CA1200","CA1200","JA1880","JA1880"),group=c("A","B","A","B"),background=c(33081,38931,35960,31062))
+
+quant$germline_intensity_mean_bgc = apply(quant,1,function(x){ as.numeric(x[["germline_intensity_mean"]]) - background[genotype == x[["genotype"]] &group==ifelse(x[["worm"]]<=5,"A","B"),background]; })
+      
+quant$soma_intensity_mean_bgc = apply(quant,1,function(x){ as.numeric(x[["soma_intensity_mean"]]) - background[genotype == x[["genotype"]] &group==ifelse(x[["worm"]]<=5,"A","B"),background] })
+      
+
+ggplot(quant,aes(soma_intensity_mean,soma_intensity_mean_bgc,color=promoter))+geom_point() + geom_vline(xintercept=background$background,col="gray")
+
+lm(germline_intensity_median~genotype,quant )
+
+quant_long=melt(quant[,.(worm,promoter,soma_intensity_p75,germline_intensity_p75)],id.vars = c("worm","promoter"))
+ggplot(quant_long,aes(variable,value,color=promoter))+geom_point()
+
+
+quant_long=melt(quant[,.(worm,promoter,soma_intensity_mean,germline_intensity_mean)],id.vars = c("worm","promoter"))
+ggplot(quant_long,aes(variable,value,color=promoter))+geom_point()
+
+quant_long=melt(quant[,.(worm,promoter,soma_intensity_mean_bgc,germline_intensity_mean_bgc)],id.vars = c("worm","promoter"))
+ggplot(quant_long,aes(variable,value,color=promoter))+geom_point()
+
+
+```
+
+
+
+```{r,fig.width=10,fig.height=4}
+quant2=fread("quantification_soma_germline_head(in).csv")
+quant2$genotype = quant2$condition
+quant2$germline_intensity_mean = quant2$germline_mean/10000
+quant2$soma_intensity_mean = quant2$soma_mean/10000
+quant2$head_intensity_mean = quant2$head_mean/10000
+quant = quant2
+quant[,promoter:=ifelse(genotype=="CA1200","eft-3p","eif-3B")]
+quant$prom_f = factor(quant$promoter)
+
+background = data.table(genotype=c("CA1200","CA1200","JA1880","JA1880"),group=c("A","B","A","B"),background=c(33081,38931,35960,31062))
+
+quant$germline_intensity_mean_bgc = apply(quant,1,function(x){ as.numeric(x[["germline_mean"]]) - background[genotype == x[["genotype"]] &group==x[["replicate"]],background]; })
+      
+quant$soma_intensity_mean_bgc = apply(quant,1,function(x){ as.numeric(x[["soma_intensity_mean"]]) - background[genotype == x[["genotype"]] &group==x[["replicate"]],background] })
+      
+
+ggplot(quant,aes(soma_intensity_mean,soma_intensity_mean_bgc,color=promoter))+geom_point() + geom_vline(xintercept=background$background,col="gray")
+
+#lm(germline_intensity_median~genotype,quant )
+
+#quant_long=melt(quant[,.(worm,promoter,soma_intensity_p75,germline_intensity_p75)],id.vars = c("worm","promoter"))
+#ggplot(quant_long,aes(variable,value,color=promoter))+geom_point()
+
+
+quant_long=melt(quant[,.(worm,promoter,soma_intensity_mean,germline_intensity_mean)],id.vars = c("worm","promoter"))
+ggplot(quant_long,aes(variable,value,color=promoter))+geom_point()
+
+quant_long=melt(quant[,.(worm,promoter,soma_intensity_mean_bgc,germline_intensity_mean_bgc)],id.vars = c("worm","promoter"))
+ggplot(quant_long,aes(variable,value,color=promoter))+geom_point()
+
+
+make_pretty_sig = function(glm_res){
+  soma_glm_s = data.frame(summary(glm_res)$coefficients)["genotypeJA1880",]
+  soma_glm_s$sig = ifelse (soma_glm_s[,"Pr...t.."]<.01,"*","")
+  soma_glm_s$sig = paste0("p=",formatC(signif(soma_glm_s[,"Pr...t.."], digits=3), digits=3, format="g"))
+  soma_glm_s$group1 = levels(quant$prom_f)[1]
+  soma_glm_s$group2 = levels(quant$prom_f)[2]
+  soma_glm_s
+}
+  
+  
+soma_glm = glm(soma_intensity_mean~genotype,quant,family=stats::gaussian(link="log"))
+soma_glm_s = make_pretty_sig(soma_glm)
+list("Soma",c(exp(c(soma_glm_s[,1],soma_glm_s[,1]-soma_glm_s[,2],soma_glm_s[,1]+soma_glm_s[,2])),soma_glm_s[,4]))
+
+list("Soma",c(exp(-c(soma_glm_s[,1],soma_glm_s[,1]-soma_glm_s[,2],soma_glm_s[,1]+soma_glm_s[,2])),soma_glm_s[,4]))
+
+ sf= ggplot(quant,aes(x=prom_f,y=soma_intensity_mean,group=prom_f,color=prom_f)) + geom_point() + xlab("TIR1 Promoter") + ylab("Somatic\nFluorescence (A.U.)")+ theme(legend.position = "none")+ stat_pvalue_manual(data=soma_glm_s,comparisons = list(levels(quant$prom_f)),label ="sig",y.position=max(quant$soma_intensity_mean*1.05))+ scale_y_continuous(expand = expansion(mult = c(0.15, 0.15)))
+ 
+
+germline_glm = glm(germline_intensity_mean~genotype,quant,family=stats::gaussian(link="log")) 
+germline_glm_s = make_pretty_sig(germline_glm)
+list("Germline",c(exp(c(germline_glm_s[,1],germline_glm_s[,1]-germline_glm_s[,2],germline_glm_s[,1]+germline_glm_s[,2])),germline_glm_s[,4]))
+
+gf = ggplot(quant,aes(promoter,germline_intensity_mean,color=prom_f)) + geom_point() + xlab("TIR1 Promoter") + ylab("Germline\nFluorescence (A.U)")+ theme(legend.position = "none")+ stat_pvalue_manual(data=head_glm_s,comparisons = list(levels(quant$prom_f)),label ="sig",y.position=max(quant$germline_intensity_mean*1.05))+ scale_y_continuous(expand = expansion(mult = c(0.15, 0.15)))
+
+
+head_glm = glm(head_intensity_mean~genotype,quant,family=stats::gaussian(link="log"))
+head_glm_s = make_pretty_sig(head_glm)
+list("Head",c(exp(c(head_glm_s[,1],head_glm_s[,1]-head_glm_s[,2],head_glm_s[,1]+head_glm_s[,2])),head_glm_s[,4]))
+
+hf= ggplot(quant,aes(promoter,head_intensity_mean,color=prom_f)) + geom_point()  + xlab("TIR1 Promoter") + ylab("Head\nFluorescence (A.U.)")+ theme(legend.position = "none")+stat_pvalue_manual(data=germline_glm_s,comparisons = list(levels(quant$prom_f)),label ="sig",y.position=max(quant$head_intensity_mean*1.05))+ scale_y_continuous(expand = expansion(mult = c(0.15, 0.15)))
+
+ggarrange(plotlist=list(sf,hf,gf),nrow=1)
+ggsave("germline_soma_quant.pdf",width=10,height=8/3)
+ggsave("germline_soma_quant.png",width=10,height=8/3)
+
+```
+
+
+```{r}
+#PLOT DAUER CROSS-REACTIVITY  
+dauer_dat = dauer_cross_long
+dauer_dat[,`tir-1`:=ifelse(`tir-1`=="wtTIR-1","F79",`tir-1`)]
+dauer_dat$Percent.Dauer = dauer_dat$Percent.Dauer/100
+
+#calculate group means and standard errors
+
+dat_aggregate_1 = aggregate(Percent.Dauer~concentration.uM+`tir-1`+Compound,dauer_dat,FUN=mean)
+names(dat_aggregate_1)[4] = "mean"
+standard_error <- function(x) sd(x) / sqrt(length(x))
+dat_aggregate_2 = aggregate(Percent.Dauer~concentration.uM+`tir-1`+Compound,dauer_dat,FUN=standard_error)
+names(dat_aggregate_2)[4] = "stderr"
+dat_aggregate = data.table(merge(dat_aggregate_1,dat_aggregate_2,by=c("concentration.uM","tir-1","Compound")))
+
+fit_excluded_concentrations = c()
+fts = lapply(unique(dat_aggregate$Compound),function(compound){
+  lapply(unique(dat_aggregate$`tir-1`),function(tir1){
+    print(paste(compound,tir1))
+    dat = dauer_dat[`tir-1`==tir1&Compound==compound,]
+    
+     rng = range(dat$concentration.uM[dat$concentration.uM>0])
+     newx = c(0,exp(seq(log(rng[1]),log(rng[2]*1.5),length.out=2000)))
+     newx = newx[!is.na(newx)]
+  
+  
+    if (max(dat$Percent.Dauer) < .25){
+        newdata=data.frame(concentration.uM=newx)
+        newdata$mean=predict(lm(Percent.Dauer~concentration.uM,dat),newdata=newdata)
+         newdata$`tir-1` = tir1
+       newdata$Compound=compound;
+       return(list(coef=data.frame("n"=0,"E0"=0,"Ef"=0,"lnIDM"=0 ,"tir-1" = tir1,
+ "Compound"=compound),newdata=newdata))
+       
+    }
+    hill_fit <- findBestHill(Percent.Dauer~concentration.uM,dat[!dat$concentration.uM %in% fit_excluded_concentrations,],defaults=c(0,1))
+ # browser()
+  hill_fit_coef = hill_fit$allfits[[hill_fit$bestModIdx]]$coefficients
+    #print(res$allfits[[res$bestModIdx]])
+   
+ 
+    
+  newdat_hill = data.frame(concentration.uM=newx,mean=evalHillEqn(newx,hill_fit_coef))
+  newdat_hill$`tir-1` = tir1
+  newdat_hill$Compound=compound;
+  hill_fit_coef2 = data.frame(t(hill_fit_coef))
+  names(hill_fit_coef2) = c("n","E0","Ef","lnIDM")
+  #the documentation says
+  #E(D) = E0 + (Ef-E0)/(1+(D/IDM)^-n)
+  #but in fact the fits are
+  #E(D) = E0 + (Ef-E0)/(1+(D^-n)*lnIDM))
+  #Note the implicit dependence of the lnIDM on n.
+  #but the IDM parameter stored 
+  hill_fit_coef2$tir1 = tir1
+  hill_fit_coef2$Compound=compound;
+  list(coef=hill_fit_coef2,newdata=newdat_hill)
+})
+})
+hill_fits = rbindlist(lapply(fts,function(x)rbindlist(lapply(x,function(y)y$newdata ))))
+hill_coefs = rbindlist(lapply(fts,function(x)rbindlist(lapply(x,function(y)y$coef ))))
+#plot everything
+gps = lapply(unique(dat_aggregate$Compound),function(compound){
+  ggplot(dat_aggregate[Compound==compound,],aes(concentration.uM,mean,fill=`tir-1`, color=`tir-1`)) + 
+    geom_line(data=hill_fits[Compound==compound,],size=1.25)+
+    geom_point(size=2,pch=21,color="black") + 
+    geom_errorbar(aes(ymax=mean+stderr,ymin=mean-stderr),color="black",width=.1) +
+   # geom_line(size=1.25)+
+    my_theme() + 
+  scale_x_continuous(paste0("[",compound,"] (uM)"),trans="log10")+
+  theme(axis.text.x = element_text(angle = 45, hjust=1))+ylab("Fraction Dauer")
+})
+ggarrange(gps[[3]]+theme(legend.title=element_blank(),legend.position=c(.4,.5)),gps[[1]]+theme(legend.position="none"),gps[[2]]+theme(legend.position="none"),nrow=1)
+ggsave("figures/1/dauer_cross_reactivity_2.pdf",width=10,height=3)
+hill_coefs$IDM = exp(hill_coefs$lnIDM)
+write.csv(hill_coefs,"dauer_cross_reaction_hill_fits.csv")
+
+summ = aggregate(Percent.Dauer~`tir-1`+Compound+concentration.uM,dauer_dat,FUN=length)
+ps3 =data.frame(figure = rep("Fig. 1 f",nrow(summ)),TIR1_variant = summ$`tir-1`,compound = summ$Compound,concentration.uM=summ$concentration.uM,N = summ$Percent.Dauer)
+ps3$units = "populations"
+
+
+```
+
+```{r}
+#plot lifespan of all variants including eif-1 and 3xdegron (for fig 2)
+dat = data_long
+dat$replicate = dat$`EXP NUMBER`
+dat[,group_f :=factor(paste(concentration.uM,TIR1_variant,promoter,degron))]
+combos = unique(dat[,.(concentration.uM,TIR1_variant,promoter,degron,group_f)])
+setkey(combos,group_f)
+sfit = survfit(Surv(dat$Day,1-dat$Censor)~dat$group_f)
+res = data.table(
+        mean=ns.survival.code::ns_survival_mean(sfit),
+        stderr=ns.survival.code::ns_survival_stderr(sfit),
+        concentration.uM=combos[substring(names(sfit$strata),nchar("dat$groupf=")+2),concentration.uM],
+        TIR1_variant=combos[substring(names(sfit$strata),nchar("dat$groupf=")+2),TIR1_variant],
+        promoter=combos[substring(names(sfit$strata),nchar("dat$groupf=")+2),promoter],
+        degron=combos[substring(names(sfit$strata),nchar("dat$groupf=")+2),degron])
+
+
+dat[,type :=factor(paste(TIR1_variant,promoter,degron))]
+combos2 = unique(dat[,.(TIR1_variant,promoter,degron,type)])
+
+t1_variants = c("79F","F79A","F79G")
+colors = c("red","green","blue")
+names(colors) =t1_variants
+
+compounds = c("NAA","5-AD-IAA","5-Ph-IAA")
+names(compounds) = t1_variants
+combos2[,compound:=compounds[TIR1_variant]]
+
+setkey(combos2,type)
+fit_excluded_concentrations = c()
+
+
+ps4 = lapply(unique(dat$type),function(typ){
+  res2 = dat[type==typ,]
+  res$TIR1_variant = as.character(res$TIR1_variant)
+  summ = aggregate(day~TIR1_variant+compound+promoter+degron+concentration.uM,res2,FUN=length);
+#summ
+ return(data.frame(figure = rep("Fig. 2 d-f",nrow(summ)),
+                   TIR1_variant=summ$TIR1_variant,
+                   promoter = summ$promoter,
+                   compound = summ$compound,
+                   degron=summ$degron,
+                   concentration.uM=summ$concentration.uM,
+                   N = summ$day,
+                   units = rep("individuals",nrow(summ))))
+})
+
+
+hfits = (lapply(unique(dat$type),function(typ){
+  dat2 = dat[type==typ,]
+  sfit= survfit(Surv(dat2$Day,1-dat2$Censor)~dat2$concentration.uM)
+  bj_fit = ns.survival.code::ns_single_bj_group(Surv(dat2$Day,1-dat2$Censor)~dat2$concentration.uM,"0")
+  
+  cfs = bj_fit$coefficients
+  cfs$coefficient = exp(cfs$coefficient)
+  cfs$group = as.numeric(cfs$group)
+  cfs$typ = typ
+  mx= max(cfs$coefficient)
+ hill_fit <<- findBestHill(coefficient~group,cfs[!cfs$group %in% fit_excluded_concentrations,],defaults=c(1,max(3*cfs$coefficient)),startparv=c(NA,0,mx,NA),mlims=mlims)
+ # browser()
+  hill_fit_coef = hill_fit$allfits[["m3Plc"]]$coefficients
+  
+  #print(res$allfits[[res$bestModIdx]])
+   
+  rng = range(cfs$group)
+  newx = seq(rng[1],rng[2]*1.5,length.out=100)
+  
+  newdat_hill = data.frame(group=newx,coefficient=(evalHillEqn(newx,hill_fit_coef)))
+  newdat_hill$typ = typ
+  hill_fit_coef2 = data.frame(t(hill_fit_coef))
+  names(hill_fit_coef2) = c("n","E0","Ef","lnIDM")
+  #the documentation says
+  #E(D) = E0 + (Ef-E0)/(1+(D/IDM)^-n)
+  #but in fact the fits are
+  #E(D) = E0 + (Ef-E0)/(1+(D^-n)*lnIDM))
+  #Note the implicit dependence of the lnIDM on n.
+  hill_fit_coef2$type = typ;
+  hill_fit_coef2
+ 
+  hill_c = round(hill_fit_coef2$n,1)
+  #print(hill_c)
+  #print(c(x=quantile(cfs$group,.25)/3, y=quantile(cfs$coefficient,.5)))
+ # print(cfs)
+  aft_plot = ggplot(cfs,aes(group,coefficient)) + geom_line(data=newdat_hill,color=colors[combos2[typ,TIR1_variant]],size=1.25)+
+    geom_errorbar(aes(ymin=coefficient-se,ymax=coefficient+se))+
+    geom_point(size=2) + xlab(paste("[",combos2[typ,compound] ,"] (uM)",sep=""))+ylab("Fold-change in Lifespan")+
+     annotate(geom="text", x=quantile(cfs$group,.25)/1.5, y=quantile(cfs$coefficient,.5), label=paste("hill=",hill_c),
+              color="black") 
+  
+  list(hill_fits = hill_fit_coef2,aft_plot=aft_plot,aft_coef=cfs,hill_predict = newdat_hill,sfit=sfit)
+}))
+names(hfits)=unique(dat$type)
+getpl = function(x)hfits[[x]]$aft_plot
+ggarrange( getpl("79F eft-3 1x"),getpl("79F eft-3 3x"), getpl("79F eif-1 1x"), getpl("79F eif-1 3x"),  getpl("F79G eft-3 1x") ,getpl("F79G eft-3 3x"), getpl("F79A eft-3 1x"),getpl("F79A eft-3 3x"),ncol=2,nrow=4)
+
+
+fits = rbindlist(lapply(hfits,function(t1){
+  t1$hill_fits
+}))
+fits$IDM = exp(fits$lnIDM)
+write.csv(fits,"lifespan_hill_coefficients.csv")
+
+
+combos2[,pt:=paste(promoter ,TIR1_variant)]
+
+getpl = function(x)hfits[[x]]$aft_coef 
+wt_aft_coefs = data.table(rbind(getpl("79F eft-3 1x"),getpl("79F eft-3 3x"), getpl("79F eif-1 1x"), getpl("79F eif-1 3x")))
+wt_aft_coefs[,`:=`(TIR1_variant=combos2[typ,TIR1_variant],promoter=combos2[typ,promoter], degron=combos2[typ,degron],pt=combos2[typ,pt])]
+F79G_aft_coefs = data.table(rbind(getpl("F79G eft-3 1x"),getpl("F79G eft-3 3x")))
+F79G_aft_coefs[,`:=`(TIR1_variant=combos2[typ,TIR1_variant],promoter=combos2[typ,promoter], degron=combos2[typ,degron],pt=combos2[typ,pt])]
+F79A_aft_coefs = data.table(rbind(getpl("F79A eft-3 1x"),getpl("F79A eft-3 3x")))
+F79A_aft_coefs[,`:=`(TIR1_variant=combos2[typ,TIR1_variant],promoter=combos2[typ,promoter], degron=combos2[typ,degron],pt=combos2[typ,pt])]
+
+getpl = function(x)hfits[[x]]$hill_predict 
+wt_hill_predict = data.table(rbind(getpl("79F eft-3 1x"),getpl("79F eft-3 3x"), getpl("79F eif-1 1x"), getpl("79F eif-1 3x")))
+wt_hill_predict[,`:=`(TIR1_variant=combos2[typ,TIR1_variant],promoter=combos2[typ,promoter], degron=combos2[typ,degron],pt=combos2[typ,pt])]
+
+F79G_hill_predict = data.table(rbind(getpl("F79G eft-3 1x"),getpl("F79G eft-3 3x")))
+F79G_hill_predict[,`:=`(TIR1_variant=combos2[typ,TIR1_variant],promoter=combos2[typ,promoter], degron=combos2[typ,degron],pt=combos2[typ,pt])]
+F79A_hill_predict = data.table(rbind(getpl("F79A eft-3 1x"),getpl("F79A eft-3 3x")))
+F79A_hill_predict[,`:=`(TIR1_variant=combos2[typ,TIR1_variant],promoter=combos2[typ,promoter], degron=combos2[typ,degron],pt=combos2[typ,pt])]
+
+max_c = 1.1*max(wt_hill_predict$coefficient, wt_aft_coefs$coefficient,F79A_aft_coefs$coefficient,F79G_aft_coefs$coefficient)
+min_c = 1
+
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+gg_color_hue(2)
+gg_color_hue(3)
+
+wt_aft_plot = ggplot(wt_aft_coefs,aes(group,coefficient,fill=pt,color=pt,lty=degron,shape=degron)) + geom_line(data=wt_hill_predict,size=1.25)+
+    scale_color_manual(values=c("#F8766D","#00BFC4"))+
+    scale_fill_manual(values=c("#F8766D","#00BFC4"))+
+    scale_shape_manual(values=c(21,24))+
+    geom_errorbar(aes(ymin=coefficient-se,ymax=coefficient+se),lty=1)+
+    geom_point(size=2,color="black",stroke=1) + xlab("[NAA](uM)")+ylab("Fold-change in Lifespan")+
+    ylim(min_c,max_c)+geom_hline(yintercept=max_c,col="gray",lty=2)
+
+F79A_aft_plot = ggplot(F79A_aft_coefs,aes(group,coefficient,lty=degron,shape=degron)) + geom_line(data=F79A_hill_predict,size=1.25,color="#00BA38")+
+    scale_shape_manual(values=c(21,24))+
+    geom_errorbar(aes(ymin=coefficient-se,ymax=coefficient+se),color="#00BA38",lty=1)+
+    geom_point(size=2,color="black",fill="#00BA38",stroke=1) + xlab("[5-Ad-IAA](uM)")+ylab("Fold-change in Lifespan")+
+    ylim(min_c,max_c)+geom_hline(yintercept=max_c,col="gray",lty=2)
+
+F79G_aft_plot = ggplot(F79G_aft_coefs,aes(group,coefficient,lty=degron,shape=degron)) + geom_line(data=F79G_hill_predict,size=1.25,color="#619CFF")+
+    scale_shape_manual(values=c(21,24))+
+    geom_errorbar(aes(ymin=coefficient-se,ymax=coefficient+se),color="#619CFF",lty=1)+
+    geom_point(size=2,color="black",fill="#619CFF",stroke=1) + xlab("[5-Ph-IAA](uM)")+ylab("Fold-change in Lifespan")+
+    ylim(min_c,max_c)+geom_hline(yintercept=max_c,col="gray",lty=2)
+aft_plots_degron_tir1=ggarrange( wt_aft_plot,F79A_aft_plot,F79G_aft_plot,nrow=3)
+aft_plots_degron_tir1
+ggsave("aft_effect_of_auxin_across_all_strains.pdf",aft_plots_degron_tir1,height=9,width=5)
+
+
+wt_aft_plot = ggplot(wt_aft_coefs,aes(group,coefficient,color=pt,lty=degron,shape=degron)) + geom_line(size=1.25)+
+    geom_errorbar(aes(ymin=coefficient-se,ymax=coefficient+se))+
+    geom_point(size=2) + xlab("[NAA](uM)")+ylab("Fold-change in Lifespan")+
+    ylim(min_c,max_c)+geom_hline(yintercept=max_c,col="gray",lty=2)
+F79A_aft_plot = ggplot(F79A_aft_coefs,aes(group,coefficient,color=pt,lty=degron,shape=degron)) + geom_line(size=1.25)+
+    geom_errorbar(aes(ymin=coefficient-se,ymax=coefficient+se))+
+    geom_point(size=2) + xlab("[5-Ad-IAA](uM)")+ylab("Fold-change in Lifespan")+
+    ylim(min_c,max_c)+geom_hline(yintercept=max_c,col="gray",lty=2)
+F79G_aft_plot = ggplot(F79G_aft_coefs,aes(group,coefficient,color=pt,lty=degron,shape=degron)) + geom_line(size=1.25)+
+    geom_errorbar(aes(ymin=coefficient-se,ymax=coefficient+se))+
+    geom_point(size=2) + xlab("[5-Ph-IAA](uM)")+ylab("Fold-change in Lifespan")+
+    ylim(min_c,max_c)+geom_hline(yintercept=max_c,col="gray",lty=2)
+ggarrange( wt_aft_plot,F79A_aft_plot,F79G_aft_plot,nrow=3)
+
+
+max_concentrations = dat[concentration.uM %in% c(750,1.875),]
+sfit = survfit(Surv(max_concentrations$`Day of Adulthood`,1-max_concentrations$Censor)~max_concentrations$type)
+autoplot(sfit, surv.linetype = 'solid', conf.int = FALSE,
+         censor.shape = '', censor.size = 0, facets = F,surv.size=1.25)+
+  scale_x_continuous("Age (days)",limits=c(0,40))+my_theme() +theme(legend.position=c(.01,.2))+scale_y_continuous("Fraction Surviving",breaks=seq(0,1,.25),labels=c(0,"","0.5","","1")) 
+
+tv = unique(max_concentrations$TIR1_variant)
+tv_plots=lapply(tv,function(t1){
+  mx=max_concentrations[TIR1_variant==t1,]
+  sfit = survfit(Surv(mx$`Day of Adulthood`,1-mx$Censor)~mx$type)
+autoplot(sfit, surv.linetype = 'solid', conf.int = FALSE,
+         censor.shape = '', censor.size = 0, facets = F,surv.size=1.25)+
+  scale_x_continuous("Age (days)",limits=c(0,40))+my_theme() +theme(legend.position=c(.01,.5))+scale_y_continuous("Fraction Surviving",breaks=seq(0,1,.25),labels=c(0,"","0.5","","1")) 
+})
+names(tv_plots) = tv;
+survival_effect_of_degron_at_max=ggarrange( tv_plots[[1]],tv_plots[[2]],tv_plots[[3]],nrow=3)
+
+
+tv = unique(max_concentrations$degron)
+tv_plots=lapply(tv,function(t1){
+  mx=max_concentrations[degron==t1,]
+  sfit = survfit(Surv(mx$`Day of Adulthood`,1-mx$Censor)~mx$type)
+autoplot(sfit, surv.linetype = 'solid', conf.int = FALSE,
+         censor.shape = '', censor.size = 0, facets = F,surv.size=1.25)+
+  scale_x_continuous("Age (days)",limits=c(0,40))+my_theme() +theme(legend.position=c(.01,.4))+scale_y_continuous("Fraction Surviving",breaks=seq(0,1,.25),labels=c(0,"","0.5","","1")) 
+})
+names(tv_plots) = tv;
+survival_effect_of_TIR1_at_max=ggarrange( tv_plots[[1]],tv_plots[[2]],nrow=3)
+
+ggarrange(
+survival_effect_of_degron_at_max,
+survival_effect_of_TIR1_at_max,ncol=2)
+ggsave("aft_effect_of_auxin_survival.pdf",height=9,width=9)
+
+ylab = seq(10,26,2);
+#scaleFUN <- function(x) sprintf("%.0f", x)
+all_points = ggplot(res[concentration.uM>0],aes(concentration.uM,mean,color=paste(TIR1_variant,promoter),shape=degron)) +
+geom_ribbon(aes(ymax=mean+stderr,ymin=mean-stderr,bg=paste(TIR1_variant,promoter)),size=0,width=0,alpha=.3,lty=0)+
+geom_point(size=4)+geom_line(size=1.25,se=F)+facet_wrap(~TIR1_variant,scales="free_x") +scale_y_continuous("Mean Lifespan (days)", breaks=ylab, limits=c(10,25))+ scale_x_continuous("Concentration (uM)")+
+  my_theme()     + theme(axis.text.x = element_text(angle = 45, hjust=1),legend.position="none")
+
+dat2 = dat[concentration.uM == 0,]
+sfit2 = survfit(Surv(day,1-Censor)~TIR1_variant+promoter+degron,data=dat)
+autoplot(sfit2, surv.linetype = 'solid', conf.int = FALSE,
+         censor.shape = '', censor.size = 0, facets = F,surv.size=1.25)+
+  labs(color="")+scale_x_continuous("Age (days)",limits=c(0,40))+my_theme() +theme(legend.position=c(.01,.2))+scale_y_continuous("Fraction Surviving",breaks=seq(0,1,.25),labels=c(0,"","0.5","","1"))
+
+
+
+res2 = res[concentration.uM %in% c(750,1.875),]
+
+high_conc = ggplot(res2,aes(paste0(promoter,"; ",degron,"AID"),mean,color=TIR1_variant,shape=degron))+geom_point(size=4)+geom_errorbar(aes(ymin=mean-stderr,ymax=mean+stderr),lwd=1.25) + my_theme() + theme(axis.text.x = element_text(angle = 45, hjust=1),legend_position="none")+facet_grid(~TIR1_variant,scale="free_x",space="free_x")+xlab("")+ylab("Lifespan (days)")
+
+res2 = res[concentration.uM==0]
+low_conc = ggplot(res2,aes(paste0(promoter,"; ",degron,"AID"),mean,color=TIR1_variant,shape=degron))+geom_point(size=4)+geom_errorbar(aes(ymin=mean-stderr,ymax=mean+stderr),lwd=1.25) + my_theme() + theme(axis.text.x = element_text(angle = 45, hjust=1),legend_position="none")+facet_grid(~TIR1_variant,scale="free_x",space="free_x")+xlab("")+ylab("Lifespan (days)")
+
+gp_all_lifespan = grid.arrange(all_points,                             # First row with one plot spaning over 2 columns
+             arrangeGrob(high_conc, low_conc, nrow = 2), # Second row with 2 plots in 2 different columns
+             ncol = 2    ) 
+plot(gp_all_lifespan)
+ggsave("TIR1_new_variants_lifespan.pdf",gp_all_lifespan,width=16,height=6)
+```
+
+
+
+```{r}
+#plot the dauer entry of  TIR1 variants (for fig. 2)
+dat = all_dauer
+dat$Percent.Dauer = dat$Percent.Dauer/100
+dat$TIR1_variant = dat$`tir-1`;
+dat$degron = dat$`daf-2::AID`
+dat_aggregate_1 = aggregate(Percent.Dauer~concentration.uM+TIR1_variant+degron+promoter,dat,FUN=mean)
+names(dat_aggregate_1)[5] = "mean"
+standard_error <- function(x) sd(x) / sqrt(length(x))
+dat_aggregate_2 = aggregate(Percent.Dauer~concentration.uM+TIR1_variant+degron+promoter,dat,FUN=standard_error)
+names(dat_aggregate_2)[5] = "stderr"
+dat_aggregate = data.table(merge(dat_aggregate_1,dat_aggregate_2,by=c("concentration.uM","TIR1_variant","degron","promoter")))
+dauer_range = ggplot(dat_aggregate[concentration.uM>0],aes(concentration.uM,mean,fill=paste(TIR1_variant,promoter), color=paste(TIR1_variant,promoter),shape=degron,lty=degron)) + 
+  geom_point(size=2) + geom_ribbon(aes(ymax=mean+stderr,ymin=mean-stderr),size=0,lty=0,width=0,alpha=.3) +geom_line(size=1.25) + facet_wrap(~TIR1_variant,scale="free_x")+my_theme() + scale_x_continuous("Concentration (uM)",trans="log10")+theme(legend.position="none", axis.text.x = element_text(angle = 45, hjust=1))
+
+dat[,type :=factor(paste(TIR1_variant,promoter,degron))]
+combos2 = unique(dat[,.(TIR1_variant,promoter,degron,type)])
+
+t1_variants = c("79F","F79A","F79G")
+colors = c("red","green","blue")
+names(colors) =t1_variants
+
+compounds = c("NAA","5-AD-IAA","5-Ph-IAA")
+names(compounds) = t1_variants
+combos2[,compound:=compounds[TIR1_variant]]
+setkey(combos2,type)
+typs = unique(dat$type)
+cfs = lapply(typs,function(typ){
+  print(typ)
+  dat2 = dat[type==typ,]
+  hill_fit = findBestHill(Percent.Dauer~concentration.uM,dat2,defaults=c(0,max(dat2$Percent.Dauer)))
+  hill_fit_coef = hill_fit$allfits[[hill_fit$bestModIdx]]$coefficients
+  #print(res$allfits[[res$bestModIdx]])
+  rng = range(dat2$concentration.uM)
+  newx = seq(rng[1],rng[2],length.out=100)
+  newdat_hill = data.frame(concentration.uM=newx,mean=evalHillEqn(newx,hill_fit_coef))
+  newdat_hill$type=typ
+  hill_fit_coef2 = data.frame(t(hill_fit_coef))
+  names(hill_fit_coef2) = c("n","E0","Ef","lnIDM")
+  #the documentation says
+  #E(D) = E0 + (Ef-E0)/(1+(D/IDM)^-n)
+  #but in fact the fits are
+  #E(D) = E0 + (Ef-E0)/(1+(D^-n)*lnIDM))
+  #Note the implicit dependence of the lnIDM on n.
+  #but the IDM parameter stored 
+  hill_fit_coef2$type = typ;
+  list(coefs=hill_fit_coef2,predict_dat=newdat_hill)
+})
+names(cfs) = typs
+dat$mean = dat$Percent.Dauer
+new_dat_all= rbindlist(lapply(cfs,function(x)x$predict_dat))
+new_dat_all[,`:=`(TIR1_variant=combos2[type,TIR1_variant],promoter=combos2[type,promoter],degron=combos2[type,degron])]
+ggplot(dat,aes(concentration.uM,mean,shape=degron,color=promoter,lty=degron))+geom_point()+geom_line(data=new_dat_all)+facet_wrap(~TIR1_variant,scale="free_x")+scale_x_continuous(trans="log10")
+
+fits = rbindlist(lapply(cfs,function(t1){
+  t1$coefs
+}))
+fits$IDM = exp(fits$lnIDM)
+write.csv(fits,"dauer_hill_coefficients.csv")
+gps=lapply(unique(dat_aggregate$TIR1_variant),function(t1){
+  ggplot(dat_aggregate[TIR1_variant==t1,],aes(concentration.uM,mean,color=promoter,fill=promoter,shape=degron,lty=degron)) + 
+    scale_shape_manual(values=c(21,24))+
+    geom_errorbar(aes(ymax=mean+stderr,ymin=mean-stderr),size=1.25,width=.1)+ 
+    geom_line(data=new_dat_all[TIR1_variant==t1,],size=1.25) +
+    geom_point(size=2,color="black",stroke=1) + 
+    my_theme() + ylab("Fraction Dauer")+
+     scale_x_continuous(paste("[",compounds[t1],"] (uM)",sep=""),trans="log10")+theme(legend.position="none")#, axis.text.x = element_text(angle = 45, hjust=1))
+})
+
+
+ps5 = lapply(unique(dat$TIR1_variant),function(t1){
+  res2 = dat[TIR1_variant==t1,]
+  res$TIR1_variant = as.character(res$TIR1_variant)
+  summ = aggregate(Percent.Dauer~TIR1_variant+Compound+promoter+degron+concentration.uM,res2,FUN=length);
+#summ
+ return(data.frame(figure = rep("Fig. 2g-i",nrow(summ)),
+                   TIR1_variant=summ$TIR1_variant,
+                   promoter = summ$promoter,
+                   compound = summ$Compound,
+                   degron=summ$degron,
+                   concentration.uM=summ$concentration.uM,
+                   N = summ$Percent.Dauer,
+                   units = rep("plates",nrow(summ))))
+})
+
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+gg_color_hue(2)
+gg_color_hue(3)
+
+
+ggarrange(gps[[1]]+scale_color_manual(values=c("#F8766D","#00BFC4"))+scale_fill_manual(values=c("#F8766D","#00BFC4")),
+          gps[[2]]+scale_color_manual(values=c("#00BA38"))+scale_fill_manual(values=c("#00BA38")),
+          gps[[3]]+scale_color_manual(values=c("#619CFF"))+scale_fill_manual(values=c("#619CFF")),ncol=1)
+#ggsave("all_strains_dauer_with_hill_fits.pdf",width=13.5,height=3)#,height=9,width=6
+ggsave("all_strains_dauer_with_hill_fits.pdf",height=9,width=4.5)
+
+)dat_low = dat[concentration.uM == 0,]
+dauer_low=ggplot(dat_low,aes(paste(promoter,";",`daf-2::AID`,"AID"),Percent.Dauer/100,color=`tir-1`)) + geom_jitter(width=.1) + facet_grid(~`tir-1`,scale="free_x",space="free_x")+ my_theme()+scale_y_continuous("Fraction Dauer",limits=c(0,.2))+xlab("TIR-1 Variant")+theme(legend.position="none", axis.text.x = element_text(angle = 45, hjust=1))
+
+
+gp_all_dauer = grid.arrange(dauer_range,                           
+             dauer_low, 
+             ncol = 2    ) 
+plot(gp_all_dauer)
+ggsave("TIR1_new_variants_dauer.pdf",gp_all_dauer,width=16,height=3)
+dat = all_dauer
+
+dat[,group_f :=factor(paste(`tir-1`,promoter,`daf-2::AID`))]
+combos = unique(dat[,.(`tir-1`,promoter,`daf-2::AID`,group_f)])
+setkey(combos,group_f)
+dat[,degron:=`daf-2::AID`]
+dat[,frac_dauer:=`Percent.Dauer`/100]
+sigmoid_fits = lapply(levels(d$group_f),function(g){
+  print(g)
+  d = dat[group_f==g,]
+  nls(frac_dauer~SSfpl(log10(concentration.uM), A=0, B=1, xmid, scal=s), data = d,start = c(xmid=median(log10(d$concentration.uM)),s=1))
+}
+)
+names(sigmoid_fits) = as.character(levels(d$group_f))
+
+p50 = rbindlist(lapply(names(sigmoid_fits),function(x){
+  data.frame(group_f=x,xmid=10^coef(sigmoid_fits[[x]])["xmid"]) 
+}))
+
+```
+
+```{r}
+population_sizes =  rbind(rbindlist(ps),ps2,ps3,rbindlist(ps4),rbindlist(ps5),fill=T)
+population_sizes$units[population_sizes$units=="plates"]="populations"
+population_sizes$TIR1_variant[population_sizes$TIR1_variant == "79F"] = "F79"
+write.csv(population_sizes,"tables/population_sizes.csv",row.names=F)
+
+no_repeats = population_sizes[!grepl("Fig. 1 c-d",population_sizes$figure) & !grepl("Fig. 1 e",population_sizes$figure),]
+
+lifespan=sum(apply(no_repeats,1,FUN=function(x)ifelse(x[["units"]]=="plates",as.numeric(x[["N"]])*0,as.numeric(x[["N"]]))))
+dauer=sum(apply(no_repeats,1,FUN=function(x)ifelse(x[["units"]]=="populations",as.numeric(x[["N"]]),as.numeric(x[["N"]])*0)))
+
+```
+
