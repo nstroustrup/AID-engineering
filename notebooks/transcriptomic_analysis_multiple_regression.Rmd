@@ -198,7 +198,6 @@ cat("Samples with readcounts < ", count_thresh)
 print(colnames(counts)[colSums(counts) < count_thresh])
 ```
 ### check mRNA/spike-in ratio
-We check which samples have a low content of mRNA.
 ```{r}
 mRNA_content <- colSums(castToMatrix(data = df[! grepl("^ERCC", GeneName)],
                         GeneName ~ Sample, value.var = "Count"))/
@@ -216,7 +215,6 @@ print(colnames(counts)[mRNA_content < 0.75])
 ```
 
 ### delete low count samples, delete low mRNA samples and filter low counts transcripts
-We only consider transcripts that have at least 5 counts in more than 50% of the samples. We end up with:
 ```{r echo=FALSE}
 counts <- counts[,which(colSums(counts) > count_thresh & mRNA_content > 0.75)]
 filter <- rowMeans(counts)>10 & apply(counts,1,function(x)(length(which(x>0))/length(x))>.75)
@@ -275,33 +273,26 @@ results_aux_ind_long_double[,label:=group]
 
 
 ```{r}
-#recalc the effects auxin in the presence of the double (e.g the "on target" effects) *only for wildtype
-#NOTE: Some regressions assume the effects of auxin are *additive* to the effects of TIR1, which they are *not* because adding TIR1 appears to 
-#protect the animals against some effects of Auxin.  
-#The result is that these "on-target" effects have baked into them the effects of auxin that are removed by adding TIR1
-#these effects are *different* between the different TIR1 variants and so they artifically inflate the differences between variants.
+#estimate and compare the "on-target effects effects of knocking down daf-2::AID using a variety of different TIR1 variants, accounting for the "off-target" effects of compounds using a multiple-regression model with a cross term.
 
-```
+#We consider two models depending on the p-values we want to estimate
+#y = B_compound *X+B_compound *X * B_TIR1*W + e (eq 1)
+#y = B_compound *X * B_TIR1*W + e (eq 2)
 
-
-
-
-```{r}
-#compare the effects of different variants to each other, accounting for the "off-target" effects of compounds
-#y = B_compound * B_TIR1 + e
-#for 1x degrons
-
-#this is good and important because there are effects of the compounds that are removed by adding TIR1, and modelling B_compound
-#as consistent across all conditions excludes these.
+#Note: It is crucial here that we do not assume that the effects of auxin are *additive* to the effects of TIR1 in the presence of daf-2::AID, because the presence of TIR1 appears to *remove* against some effects of Auxin, perhaps by sequestering auxin and preventing other reactions.
+#The result is that the "on-target" effects we want to estimate include only a subset of the effects of auxin measured in the auxin-only condition. 
+#So if we subtract the effects measured in the auxin-only condition from the "on target effects", we actually *introduce* auxin-effects rather than removing them.
 
 
-TIR1_reference_groups = c("WT","none")  #the first reference group lets us calculate p values for differences between WT and other variants
-                                        #the second reference group lets us calculate p values for overall effect of each variant
+#For each comparison we run two separateregressions (above), each of which use different reference conditions  for the TIR1 contrast
+TIR1_reference_groups = c("WT","none")  #the first reference group lets us calculate p values for differences between the TIR1-less wild-type and other variants (eq. 1 above)
+                                        #the second reference group lets us calculate p values comparing differential effects between TIR1 variants (eq. 2 above)
+
+#run separate regressions for the strains with daf-2::1xAID and daf-2::3xAID tags
 AID_repeats = c(1,3);
 
 multiple_regs = lapply(TIR1_reference_groups,function(TIR1_reference_group){
     res = lapply(AID_repeats,function(AID_repeat){
-  
   
     annots_ontarget = annotations_aie[Biological_replicate==1 &Day==1& (Promoter=="eft3p"& daf2AID==AID_repeat | Strain=="QZ0"),]
     genes_to_exclude = c("TIR1-DERNBERG")
@@ -312,39 +303,32 @@ multiple_regs = lapply(TIR1_reference_groups,function(TIR1_reference_group){
     annots_ontarget$TIR1_actived = relevel(factor(ifelse(annots_ontarget$AuxinType!="wo" &  annots_ontarget$Strain!="QZ0",
                                                          "active","not_active")),ref="not_active")
     
-    
-   # annots_ontarget$TIR1_actived = relevel(factor(ifelse(annots_ontarget$AuxinType!="wo" &  annots_ontarget$Strain!="QZ0",
-   #                                                      "active","not_active")),ref="active")
-    
-    #annots_ontarget$Tir1_present = relevel(factor(ifelse(!is.na(annots_ontarget$Tir1),"TIR1","none")),ref="none")
+    #Mark wild-type animals with "none" in their Tir1 variant column, rather than NA. 
     annots_ontarget$Tir1_variant = relevel(factor(ifelse(!is.na(annots_ontarget$Tir1),annots_ontarget$Tir1,"none")),ref=TIR1_reference_group)
     
-    if (TIR1_reference_group == "WT"){
+    if (TIR1_reference_group == "WT"){ #run the regression described in eq #1 above.
+      
       #we make a dummy variable to measure the "activated" state of the TIR1s
       #irrespective of the compound used to activate them.
-      #there is no 'active' state for QZ0 wild-type animals, so we need to remove the 
+      
+      #Since there is no data corresponding to an 'activated' state for wild-type animals (e.g adding compound doesn't activate anthing)
+      #to have a solvable model we  remove the corresponding
       #interaction term for this level ( Tir1_variantnone:TIR1_activedactive) from the model matrix
       m1 <- model.matrix(~ AuxinType+Tir1_variant*TIR1_actived, annots_ontarget)
-    }else{
-      #we can use the auxin type in the cross model with no dummy variable
-      #but we have to remove the remove the 
-      #interaction terms for the TIR1 variant * compound combinations not tested.
+    }else{ #run the regression described in eq #2 above
+      #we don't need any extra dummy variables.
+      #however, we didn't collect data testing TIR1 variants with compounds other than their ideal ligand 
+      #(eg we look at auxin for TIR1(F79), 5-Ph for TIR1(F79G), but not TIR1(F79) with 5-Ph)
+      #So to have a solvable model we remove interaction terms for the TIR1 variant * compound combinations not tested.
         m1 <- model.matrix(~ AuxinType*Tir1_variant, annots_ontarget)
     }
+    #this code removes the un-measured interaction terms.
     all.zero <- apply(m1, 2, function(x) all(x==0))
     if (any(all.zero)){
       m2 = m1[,-which(all.zero)]
     }else m2 = m1
     
-    
-    #print((annots_ontarget[,.(AuxinType, Tir1_variant,TIR1_actived)]))
-    #stop()
-    #dds_aux_other_variants_vs_F79= DESeqDataSetFromMatrix(countData = counts_ontarget,
-    #                                     colData = annots_ontarget,
-     #                                    design = ~ AuxinType+Tir1_variant*TIR1_actived
-    #                                     )
-    
-    
+  
     dds_aux_other_variants_vs_F79= DESeqDataSetFromMatrix(countData = counts_ontarget,
                                          colData = annots_ontarget,
                                          design = m2
@@ -1936,7 +1920,7 @@ if (any(aggregate(log2FoldChange~GeneName,d_eft3_F79A[quantification_type == "TI
   stop("This data structure should have two of each genes: the effect of the compound (orig_label == compound name) and the effect of the TIR1 (orig_label == TIR1 variant0, which we need to add toggether get the overall effect")
 
 
-#this data is all comming from the fits to the original regression model
+#this data is all coming from the fits to the original regression model
 #y = compound * TIR1 + e 
 #regression model
 #to get the overall effect of the AID system, here we add the compound effect terms to the ( TIR1 + compound*TIR1 ) effects calculated earlier and written to the supplementary file.
